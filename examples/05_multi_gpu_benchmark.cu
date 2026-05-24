@@ -2,7 +2,10 @@
 // GFD Multi-GPU Benchmark (8 GPUs, NUMA-Optimized)
 //
 // Measures aggregate H2D transfer bandwidth across multiple GPUs
-// using GFD Direct mode with full NUMA-aware optimization.
+// comparing:
+//   1. cudaMemcpy(N):       Per-token cudaMemcpyAsync (baseline)
+//   2. cudaMemcpyBatchAsync: CUDA 12.8+ batch API (single call)
+//   3. GFD Direct:          CPU direct-submit (parallel gather + CE DMA)
 //
 // Optimizations:
 //   - Per-GPU staging buffers allocated on local NUMA node
@@ -64,8 +67,41 @@ struct GPUContext {
     gfd::DescriptorQueue* queue;
     gfd::CpuPollingThread* poller;
     gfd::SGEntry*   sg_entries;
+    cudaStream_t    stream;
     std::vector<double> latencies;
+    // Pre-allocated arrays for cudaMemcpyBatchAsync (avoid heap contention)
+    std::vector<void*>       batch_dsts;
+    std::vector<const void*> batch_srcs;
+    std::vector<size_t>      batch_sizes;
+    std::vector<size_t>      batch_attr_idxs;
+    cudaMemcpyAttributes     batch_attr;
 };
+
+// ---- Benchmark: cudaMemcpy(N) ----
+static double bench_memcpy_N(GPUContext& ctx) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int t = 0; t < NUM_TOKENS; t++) {
+        void* dst = ctx.gpu_buf + (size_t)t * TOKEN_SIZE;
+        void* src = ctx.cpu_buf + (size_t)t * TOKEN_SIZE * SCATTER_STRIDE;
+        cudaMemcpyAsync(dst, src, TOKEN_SIZE, cudaMemcpyHostToDevice, ctx.stream);
+    }
+    cudaStreamSynchronize(ctx.stream);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::micro>(t1 - t0).count();
+}
+
+// ---- Benchmark: cudaMemcpyBatchAsync (uses pre-allocated arrays) ----
+static double bench_memcpy_batch(GPUContext& ctx) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    cudaMemcpyBatchAsync(
+        (void* const*)ctx.batch_dsts.data(),
+        (const void* const*)ctx.batch_srcs.data(),
+        ctx.batch_sizes.data(), NUM_TOKENS,
+        &ctx.batch_attr, ctx.batch_attr_idxs.data(), 1, ctx.stream);
+    cudaStreamSynchronize(ctx.stream);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::micro>(t1 - t0).count();
+}
 
 // ---- Spin barrier (lock-free, reusable) ----
 class SpinBarrier {
@@ -198,6 +234,9 @@ int main() {
         // Allocate GPU buffer
         cudaMalloc(&ctx.gpu_buf, TOTAL_SIZE);
 
+        // Create stream for memcpy benchmarks
+        cudaStreamCreate(&ctx.stream);
+
         // Allocate descriptor queue (pinned, for poller)
         cudaHostAlloc(&ctx.queue, sizeof(gfd::DescriptorQueue), cudaHostAllocMapped);
         memset(ctx.queue, 0, sizeof(gfd::DescriptorQueue));
@@ -208,6 +247,20 @@ int main() {
             ctx.sg_entries[t].dst  = (CUdeviceptr)(ctx.gpu_buf + (size_t)t * TOKEN_SIZE);
             ctx.sg_entries[t].src  = ctx.cpu_buf + (size_t)t * TOKEN_SIZE * SCATTER_STRIDE;
             ctx.sg_entries[t].size = TOKEN_SIZE;
+        }
+
+        // Pre-allocate batch arrays (avoid heap contention in parallel runs)
+        ctx.batch_dsts.resize(NUM_TOKENS);
+        ctx.batch_srcs.resize(NUM_TOKENS);
+        ctx.batch_sizes.resize(NUM_TOKENS);
+        ctx.batch_attr_idxs.resize(NUM_TOKENS, 0);
+        ctx.batch_attr = {};
+        ctx.batch_attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        ctx.batch_attr.flags = 0;
+        for (int t = 0; t < NUM_TOKENS; t++) {
+            ctx.batch_dsts[t] = ctx.gpu_buf + (size_t)t * TOKEN_SIZE;
+            ctx.batch_srcs[t] = ctx.cpu_buf + (size_t)t * TOKEN_SIZE * SCATTER_STRIDE;
+            ctx.batch_sizes[t] = TOKEN_SIZE;
         }
 
         // Create polling thread:
@@ -229,35 +282,54 @@ int main() {
 
     printf("All %d GPUs initialized (per-GPU NUMA-local staging)\n\n", num_gpus);
 
-    // ---- Test 1: Per-GPU sequential bandwidth ----
+    // ---- Test 1: Per-GPU sequential bandwidth (3 methods) ----
     printf("────────────────────────────────────────────────────────────\n");
-    printf("  Test 1: Per-GPU Bandwidth (sequential)\n");
+    printf("  Test 1: Per-GPU Bandwidth (sequential, 3 methods)\n");
     printf("────────────────────────────────────────────────────────────\n\n");
+
+    printf("  +------+------+--------------+--------------+--------------+\n");
+    printf("  | %4s | %4s | %12s | %12s | %12s |\n",
+           "GPU", "NUMA", "Memcpy(N)", "BatchAsync", "GFD Direct");
+    printf("  +------+------+--------------+--------------+--------------+\n");
 
     for (int i = 0; i < num_gpus; i++) {
         GPUContext& ctx = contexts[i];
         cuCtxSetCurrent(ctx.cu_ctx);
 
-        // Warmup
-        for (int w = 0; w < WARMUP; w++) {
-            ctx.poller->submit_direct(ctx.sg_entries, NUM_TOKENS);
-        }
+        // --- Memcpy(N) ---
+        for (int w = 0; w < WARMUP; w++) bench_memcpy_N(ctx);
+        std::vector<double> memcpy_lats(ITERS);
+        for (int iter = 0; iter < ITERS; iter++) memcpy_lats[iter] = bench_memcpy_N(ctx);
+        std::sort(memcpy_lats.begin(), memcpy_lats.end());
+        double memcpy_p50 = percentile(memcpy_lats, 50);
 
-        // Timed runs
+        // --- BatchAsync ---
+        for (int w = 0; w < WARMUP; w++) bench_memcpy_batch(ctx);
+        std::vector<double> batch_lats(ITERS);
+        for (int iter = 0; iter < ITERS; iter++) batch_lats[iter] = bench_memcpy_batch(ctx);
+        std::sort(batch_lats.begin(), batch_lats.end());
+        double batch_p50 = percentile(batch_lats, 50);
+
+        // --- GFD Direct ---
+        for (int w = 0; w < WARMUP; w++) ctx.poller->submit_direct(ctx.sg_entries, NUM_TOKENS);
         ctx.latencies.resize(ITERS);
-        for (int iter = 0; iter < ITERS; iter++) {
+        for (int iter = 0; iter < ITERS; iter++)
             ctx.latencies[iter] = ctx.poller->submit_direct(ctx.sg_entries, NUM_TOKENS);
-        }
+        std::sort(ctx.latencies.begin(), ctx.latencies.end());
+        double gfd_p50 = percentile(ctx.latencies, 50);
 
-        double p50 = percentile(ctx.latencies, 50);
-        double bw = TOTAL_SIZE / (p50 * 1e3);
-        printf("  GPU %d (NUMA %d): P50 = %7.1f us, BW = %6.2f GB/s\n",
-               i, gpu_configs[i].numa_node, p50, bw);
+        double memcpy_bw = TOTAL_SIZE / (memcpy_p50 * 1e3);
+        double batch_bw = TOTAL_SIZE / (batch_p50 * 1e3);
+        double gfd_bw = TOTAL_SIZE / (gfd_p50 * 1e3);
+
+        printf("  | %4d | %4d | %5.1f GB/s   | %5.1f GB/s   | %5.1f GB/s   |\n",
+               i, gpu_configs[i].numa_node, memcpy_bw, batch_bw, gfd_bw);
     }
+    printf("  +------+------+--------------+--------------+--------------+\n");
 
-    // ---- Test 2: Parallel scaling with persistent threads ----
+    // ---- Test 2: Parallel scaling with persistent threads (3 methods) ----
     printf("\n────────────────────────────────────────────────────────────\n");
-    printf("  Test 2: Aggregate Bandwidth (parallel, persistent threads)\n");
+    printf("  Test 2: Aggregate Bandwidth (parallel, 3 methods)\n");
     printf("────────────────────────────────────────────────────────────\n\n");
 
     std::vector<int> gpu_counts;
@@ -268,68 +340,95 @@ int main() {
         gpu_counts.push_back(num_gpus);
     }
 
-    printf("  +-----------+----------+----------+----------+------------+----------+\n");
-    printf("  | %9s | %8s | %8s | %8s | %10s | %8s |\n",
-           "GPUs", "P50 (us)", "P90 (us)", "Max (us)", "Agg BW", "Eff.");
-    printf("  +-----------+----------+----------+----------+------------+----------+\n");
+    printf("  +-----------+--------------+--------------+--------------+\n");
+    printf("  | %9s | %12s | %12s | %12s |\n",
+           "GPUs", "Memcpy(N)", "BatchAsync", "GFD Direct");
+    printf("  +-----------+--------------+--------------+--------------+\n");
 
     double single_gpu_bw = 0;
 
     for (int num_active : gpu_counts) {
-        // Per-GPU results
-        std::vector<std::vector<double>> per_gpu_lats(num_active);
-        for (auto& v : per_gpu_lats) v.resize(ITERS);
-
-        SpinBarrier barrier(num_active);
-
-        // Launch persistent worker threads
-        std::vector<std::thread> workers;
-        for (int i = 0; i < num_active; i++) {
-            workers.emplace_back([&, i]() {
-                GPUContext& ctx = contexts[i];
-                cuCtxSetCurrent(ctx.cu_ctx);
-                // Pin this worker thread to a dedicated core
-                pin_to_cpu(gpu_configs[i].core_base + gpu_configs[i].core_count - 1);
-
-                // Phase 0: Warmup
-                for (int w = 0; w < WARMUP; w++) {
-                    barrier.wait();
-                    ctx.poller->submit_direct(ctx.sg_entries, NUM_TOKENS);
-                }
-
-                // Phase 1: Timed iterations
-                for (int iter = 0; iter < ITERS; iter++) {
-                    barrier.wait();
-                    per_gpu_lats[i][iter] = ctx.poller->submit_direct(ctx.sg_entries, NUM_TOKENS);
-                }
-            });
-        }
-
-        for (auto& t : workers) t.join();
-
-        // Compute max-across-GPUs latency per iteration
-        std::vector<double> max_lats(ITERS);
-        for (int iter = 0; iter < ITERS; iter++) {
-            double m = 0;
+        // --- Method 1: Memcpy(N) parallel ---
+        {
+            std::vector<std::vector<double>> per_gpu_lats(num_active);
+            for (auto& v : per_gpu_lats) v.resize(ITERS);
+            SpinBarrier barrier(num_active);
+            std::vector<std::thread> workers;
             for (int i = 0; i < num_active; i++) {
-                m = std::max(m, per_gpu_lats[i][iter]);
+                workers.emplace_back([&, i]() {
+                    GPUContext& ctx = contexts[i];
+                    cuCtxSetCurrent(ctx.cu_ctx);
+                    pin_to_cpu(gpu_configs[i].core_base + gpu_configs[i].core_count - 1);
+                    for (int w = 0; w < WARMUP; w++) { barrier.wait(); bench_memcpy_N(ctx); }
+                    for (int iter = 0; iter < ITERS; iter++) { barrier.wait(); per_gpu_lats[i][iter] = bench_memcpy_N(ctx); }
+                });
             }
-            max_lats[iter] = m;
+            for (auto& t : workers) t.join();
+            std::vector<double> max_lats(ITERS);
+            for (int iter = 0; iter < ITERS; iter++) {
+                double m = 0;
+                for (int i = 0; i < num_active; i++) m = std::max(m, per_gpu_lats[i][iter]);
+                max_lats[iter] = m;
+            }
+            double p50 = percentile(max_lats, 50);
+            double memcpy_bw = (double)num_active * TOTAL_SIZE / (p50 * 1e3);
+
+        // --- Method 2: BatchAsync parallel ---
+            std::vector<std::vector<double>> per_gpu_lats2(num_active);
+            for (auto& v : per_gpu_lats2) v.resize(ITERS);
+            SpinBarrier barrier2(num_active);
+            std::vector<std::thread> workers2;
+            for (int i = 0; i < num_active; i++) {
+                workers2.emplace_back([&, i]() {
+                    GPUContext& ctx = contexts[i];
+                    cuCtxSetCurrent(ctx.cu_ctx);
+                    pin_to_cpu(gpu_configs[i].core_base + gpu_configs[i].core_count - 1);
+                    for (int w = 0; w < WARMUP; w++) { barrier2.wait(); bench_memcpy_batch(ctx); }
+                    for (int iter = 0; iter < ITERS; iter++) { barrier2.wait(); per_gpu_lats2[i][iter] = bench_memcpy_batch(ctx); }
+                });
+            }
+            for (auto& t : workers2) t.join();
+            std::vector<double> max_lats2(ITERS);
+            for (int iter = 0; iter < ITERS; iter++) {
+                double m = 0;
+                for (int i = 0; i < num_active; i++) m = std::max(m, per_gpu_lats2[i][iter]);
+                max_lats2[iter] = m;
+            }
+            double batch_p50 = percentile(max_lats2, 50);
+            double batch_bw = (double)num_active * TOTAL_SIZE / (batch_p50 * 1e3);
+
+        // --- Method 3: GFD Direct parallel ---
+            std::vector<std::vector<double>> per_gpu_lats3(num_active);
+            for (auto& v : per_gpu_lats3) v.resize(ITERS);
+            SpinBarrier barrier3(num_active);
+            std::vector<std::thread> workers3;
+            for (int i = 0; i < num_active; i++) {
+                workers3.emplace_back([&, i]() {
+                    GPUContext& ctx = contexts[i];
+                    cuCtxSetCurrent(ctx.cu_ctx);
+                    pin_to_cpu(gpu_configs[i].core_base + gpu_configs[i].core_count - 1);
+                    for (int w = 0; w < WARMUP; w++) { barrier3.wait(); ctx.poller->submit_direct(ctx.sg_entries, NUM_TOKENS); }
+                    for (int iter = 0; iter < ITERS; iter++) { barrier3.wait(); per_gpu_lats3[i][iter] = ctx.poller->submit_direct(ctx.sg_entries, NUM_TOKENS); }
+                });
+            }
+            for (auto& t : workers3) t.join();
+            std::vector<double> max_lats3(ITERS);
+            for (int iter = 0; iter < ITERS; iter++) {
+                double m = 0;
+                for (int i = 0; i < num_active; i++) m = std::max(m, per_gpu_lats3[i][iter]);
+                max_lats3[iter] = m;
+            }
+            double gfd_p50 = percentile(max_lats3, 50);
+            double gfd_bw = (double)num_active * TOTAL_SIZE / (gfd_p50 * 1e3);
+
+            if (num_active == 1) single_gpu_bw = gfd_bw;
+
+            printf("  | %4d GPU%s | %7.2f GB/s | %7.2f GB/s | %7.2f GB/s |\n",
+                   num_active, num_active > 1 ? "s" : " ",
+                   memcpy_bw, batch_bw, gfd_bw);
         }
-
-        double p50 = percentile(max_lats, 50);
-        double p90 = percentile(max_lats, 90);
-        double max_val = *std::max_element(max_lats.begin(), max_lats.end());
-        double agg_bw = (double)num_active * TOTAL_SIZE / (p50 * 1e3);
-
-        if (num_active == 1) single_gpu_bw = agg_bw;
-        double efficiency = agg_bw / (single_gpu_bw * num_active) * 100.0;
-
-        printf("  | %4d GPU%s | %8.1f | %8.1f | %8.1f | %7.2f GB/s | %5.1f%%  |\n",
-               num_active, num_active > 1 ? "s" : " ",
-               p50, p90, max_val, agg_bw, efficiency);
     }
-    printf("  +-----------+----------+----------+----------+------------+----------+\n");
+    printf("  +-----------+--------------+--------------+--------------+\n");
 
     // ---- Test 3: NUMA locality analysis ----
     if (num_gpus >= 8) {
@@ -447,6 +546,7 @@ int main() {
         cuCtxSetCurrent(ctx.cu_ctx);
         ctx.poller->stop();
         delete ctx.poller;
+        cudaStreamDestroy(ctx.stream);
         cudaFreeHost(ctx.sg_entries);
         cudaFreeHost(ctx.queue);
         cudaFree(ctx.gpu_buf);
@@ -455,3 +555,4 @@ int main() {
 
     return 0;
 }
+

@@ -24,6 +24,12 @@
 #include <chrono>
 #include <algorithm>
 #include <vector>
+#include <string>
+#include <random>
+
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 // ---- GFD benchmark kernels (submit/wait split) ----
 
@@ -72,6 +78,75 @@ struct TimingStats {
 static TimingStats compute_stats(std::vector<double>& v) {
     std::sort(v.begin(), v.end());
     return { percentile(v, 50), percentile(v, 90) };
+}
+
+static int env_int(const char* name, int def) {
+    const char* s = getenv(name);
+    if (!s || !*s) return def;
+    char* end = nullptr;
+    long v = strtol(s, &end, 10);
+    return (end && *end == '\0' && v > 0) ? (int)v : def;
+}
+
+static bool env_flag(const char* name) {
+    const char* s = getenv(name);
+    return s && s[0] != '\0' && s[0] != '0';
+}
+
+static void pin_current_thread_to_cpu_local(int cpu_id) {
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu_id, &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+#else
+    (void)cpu_id;
+#endif
+}
+
+static size_t parse_size_token(const std::string& tok) {
+    if (tok.empty()) return 0;
+    std::string s = tok;
+    for (char& c : s) {
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    }
+    size_t mult = 1;
+    if (s.size() >= 2 && s.substr(s.size() - 2) == "KB") {
+        mult = 1024;
+        s.resize(s.size() - 2);
+    } else if (s.size() >= 2 && s.substr(s.size() - 2) == "MB") {
+        mult = 1024 * 1024;
+        s.resize(s.size() - 2);
+    } else if (s.size() >= 1 && s.back() == 'B') {
+        s.pop_back();
+    }
+    char* end = nullptr;
+    long v = strtol(s.c_str(), &end, 10);
+    if (!end || *end != '\0' || v <= 0) return 0;
+    return (size_t)v * mult;
+}
+
+static std::vector<int> parse_size_list_env(const char* name) {
+    std::vector<int> out;
+    const char* s = getenv(name);
+    if (!s || !*s) return out;
+    std::string cur;
+    auto flush = [&]() {
+        if (cur.empty()) return;
+        size_t sz = parse_size_token(cur);
+        if (sz > 0 && sz <= (size_t)INT32_MAX) out.push_back((int)sz);
+        cur.clear();
+    };
+    for (const char* p = s; ; ++p) {
+        char c = *p;
+        if (c == ',' || c == ';' || c == '\0') {
+            flush();
+            if (c == '\0') break;
+        } else if (c != ' ' && c != '\t') {
+            cur.push_back(c);
+        }
+    }
+    return out;
 }
 
 static cudaError_t memcpy_batch_async_compat(
@@ -307,6 +382,17 @@ int main() {
     char gpu_name[256];
     cuDeviceGetName(gpu_name, sizeof(gpu_name), dev);
 
+    bool large_sweep = env_flag("GFD_LARGE_SWEEP");
+    int large_sweep_num_tokens = env_int("GFD_LARGE_SWEEP_NUM_TOKENS", 128);
+    bool randomize_addrs = env_flag("GFD_RANDOMIZE_ADDRS");
+    bool strict_bind = env_flag("GFD_STRICT_BIND");
+    unsigned addr_seed = (unsigned)env_int("GFD_ADDR_SEED", 12345);
+
+    if (strict_bind) {
+        // Keep benchmark submission thread off poller/gather worker cores.
+        pin_current_thread_to_cpu_local(31);
+    }
+
     // ---- Test configurations ----
     struct Config { int num_tokens; int token_bytes; };
 
@@ -333,24 +419,20 @@ int main() {
     int nc = sizeof(group_c) / sizeof(group_c[0]);
 
     // Large-sweep mode: fixed token count, vary token_size above 64KB
-    Config group_large[] = {
-        {  128,   65536 },
-        {  128,  131072 },
-        {  128,  262144 },
-        {  128,  524288 },
-        {  128, 1048576 },
-        {  128, 2097152 },
-    };
-    int nl = sizeof(group_large) / sizeof(group_large[0]);
-
-    bool large_sweep = false;
-    if (const char* env = getenv("GFD_LARGE_SWEEP")) {
-        large_sweep = env[0] != '\0' && env[0] != '0';
+    std::vector<int> large_sizes = parse_size_list_env("GFD_LARGE_SWEEP_TOKEN_SIZES");
+    if (large_sizes.empty()) {
+        large_sizes = { 65536, 131072, 262144, 524288, 1048576, 2097152 };
     }
+    std::vector<Config> group_large;
+    for (int sz : large_sizes) group_large.push_back({ large_sweep_num_tokens, sz });
+    int nl = (int)group_large.size();
+
     if (large_sweep) {
         g_warmup = 5;
         g_iters = 20;
     }
+    g_warmup = env_int("GFD_WARMUP", g_warmup);
+    g_iters = env_int("GFD_ITERS", g_iters);
 
     // Group B: vary token_size (fixed num_tokens = 2048)
     Config group_b[] = {
@@ -468,10 +550,19 @@ int main() {
         int N = cfg.num_tokens;
         int T = cfg.token_bytes;
         size_t total  = (size_t)N * T;
-        size_t stride = (size_t)T * SCATTER_STRIDE;
+
+        std::vector<int> slot_idx(N);
+        if (randomize_addrs) {
+            std::vector<int> slots(N * SCATTER_STRIDE);
+            for (int i = 0; i < (int)slots.size(); i++) slots[i] = i;
+            std::mt19937 rng(addr_seed ^ (unsigned)N ^ ((unsigned)T << 1));
+            std::shuffle(slots.begin(), slots.end(), rng);
+            for (int i = 0; i < N; i++) slot_idx[i] = slots[i];
+        }
 
         for (int i = 0; i < N; i++) {
-            h_cpu_addrs[i] = (uint64_t)(cpu_buf + (size_t)i * stride);
+            size_t slot = randomize_addrs ? (size_t)slot_idx[i] : (size_t)i * SCATTER_STRIDE;
+            h_cpu_addrs[i] = (uint64_t)(cpu_buf + slot * (size_t)T);
             h_tokens[i].cpu_addr  = h_cpu_addrs[i];
             h_tokens[i].token_id  = i;
             h_tokens[i].expert_id = 0;
@@ -499,10 +590,13 @@ int main() {
     printf("Max total transfer: %zu MB, Max CPU buffer: %zu MB\n",
            max_total / (1024 * 1024), max_cpu_buf / (1024 * 1024));
     printf("Scattered layout: tokens at %dx stride in pinned CPU memory\n", SCATTER_STRIDE);
+    printf("Address pattern: %s\n", randomize_addrs ? "random slots in pinned CPU memory" : "regular 2x stride");
+    printf("Strict bind: %s\n", strict_bind ? "on" : "off");
     printf("Warmup: %d, Iterations: %d\n", g_warmup, g_iters);
 
     if (large_sweep) {
-        printf("\nRunning Large Sweep: vary token_size (num_tokens = 128) ...\n");
+        printf("\nRunning Large Sweep: vary token_size (num_tokens = %d) ...\n",
+               large_sweep_num_tokens);
         fflush(stdout);
 
         std::vector<Result> results_large;
@@ -510,13 +604,14 @@ int main() {
             results_large.push_back(run_config(group_large[i]));
             char sz[16];
             fmt_size(group_large[i].token_bytes, sz, sizeof(sz));
-            printf("  [%d/%d] 128 x %s done\n", i + 1, nl, sz);
+            printf("  [%d/%d] %d x %s done\n", i + 1, nl, group_large[i].num_tokens, sz);
             fflush(stdout);
         }
 
         printf("\n");
         printf("================================================================\n");
-        printf("  Large Sweep: Vary token_size (num_tokens = 128)\n");
+        printf("  Large Sweep: Vary token_size (num_tokens = %d)\n",
+               large_sweep_num_tokens);
         printf("================================================================\n");
 
         printf("\n  [Latency P50 (us)]\n\n");

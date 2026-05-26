@@ -513,3 +513,680 @@ CUDA_VISIBLE_DEVICES=0 GFD_LARGE_SWEEP=1 ./build/gfd_benchmark
 - 处理离散地址 / scatter-gather
 - 需要 CPU 侧 gather、CE 流水、或 GPU 发起的情况下维持可用路径
 - 为更复杂的 overlap / pipeline 结构提供基础
+
+## 16. 常用模型 KV Cache 基线
+
+这章给后续“模型搬运”做基线。目标不是跑最终吞吐，而是先把常用模型的 KV cache 尺寸算清楚，方便后面按 2 档或 3 档模型比较搬运时间。
+
+### 16.1 计算假设
+
+- KV cache 按 `bf16/fp16` 算，`dtype_size = 2 bytes`
+- batch = `1`
+- cache 公式：
+
+```text
+KV bytes / token = 2 * num_hidden_layers * num_key_value_heads * head_dim * dtype_size
+head_dim = hidden_size / num_attention_heads
+```
+
+### 16.2 选的模型
+
+- `meta-llama/Llama-3.1-8B-Instruct`
+- `Qwen/Qwen2.5-7B`
+- `mistralai/Mistral-7B-Instruct-v0.3`
+
+### 16.3 配置与 KV 大小
+
+| Model | Layers | Q heads | KV heads | Hidden | Head dim | KV/token | 8k ctx | 32k ctx | 128k ctx |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Llama 3.1 8B | 32 | 32 | 8 | 4096 | 128 | 128 KiB | 1 GiB | 4 GiB | 16 GiB |
+| Qwen2.5 7B | 28 | 28 | 4 | 3584 | 128 | 56 KiB | 448 MiB | 1.75 GiB | 7 GiB |
+| Mistral 7B v0.3 | 32 | 32 | 8 | 4096 | 128 | 128 KiB | 1 GiB | 4 GiB | 16 GiB |
+
+### 16.4 读法
+
+- `Qwen2.5 7B` 的 KV cache 明显更小，原因是 `28 layers + 4 KV heads`
+- `Llama 3.1 8B` 和 `Mistral 7B` 的 KV cache 同档，都是 `128 KiB/token`
+- 如果只比“搬运时间”，同一带宽下，KV cache 越小 -> 搬得越快
+- 如果要做 2 档比较，推荐先比 `Qwen2.5 7B` vs `Llama 3.1 8B / Mistral 7B`
+- 如果要做 3 档比较，这 3 个模型就够做第一版基线
+
+### 16.5 来源
+
+- Llama 3.1 8B Instruct: [model card](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) / [config.json mirror](https://huggingface.co/zgrgr/Meta-Llama-3.1-8B-Instruct/blob/main/config.json)
+- Qwen2.5 7B: [model card](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) / [config.json](https://huggingface.co/Qwen/Qwen2.5-7B/blob/main/config.json)
+- Mistral 7B v0.3: [transformers doc](https://huggingface.co/docs/transformers/model_doc/mistral) / [config.json](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3/blob/708a0609e640ac1edfb9020a7c934f51d34d6c79/config.json)
+
+### 16.6 对应实验设置
+
+为了和这章的 KV cache 档位对齐，今天额外跑了一次大尺寸 sweep：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 GFD_LARGE_SWEEP=1 ./build/gfd_benchmark
+```
+
+配置：
+
+- 日期：`2026-05-26`
+- GPU：`NVIDIA GeForce RTX 3090`
+- 固定 `num_tokens = 128`
+- token size：`64KB, 128KB, 256KB, 512KB, 1MB, 2MB`
+- Warmup：`5`
+- Iterations：`20`
+- 原始日志：`section16_large_sweep_20260526.log`
+
+这里的映射关系是：
+
+- `64KB` 档近似对应 `Qwen2.5 7B` 的 `56 KiB/token`
+- `128KB` 档直接对应 `Llama 3.1 8B` / `Mistral 7B` 的 `128 KiB/token`
+- `256KB+` 档可视为更大 KV chunk，或多 token / 多层一起搬
+
+### 16.7 实测结果
+
+| Config | Total | Memcpy(N) P50 us | BatchAsync P50 us | GFD Queue P50 us | GFD Direct P50 us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128 x 64KB | 8MB | 1035.6 | 787.2 | 1345.3 | 1293.5 |
+| 128 x 128KB | 16MB | 1710.4 | 1465.7 | 2606.6 | 2469.4 |
+| 128 x 256KB | 32MB | 3066.3 | 2824.1 | 4986.1 | 4820.1 |
+| 128 x 512KB | 64MB | 5781.8 | 5544.4 | 10387.1 | 9926.5 |
+| 128 x 1MB | 128MB | 11201.4 | 10973.8 | 21992.1 | 20469.2 |
+| 128 x 2MB | 256MB | 22083.9 | 21821.7 | 44510.8 | 41750.9 |
+
+对应带宽：
+
+| Config | Total | Memcpy(N) GB/s | BatchAsync GB/s | GFD Queue GB/s | GFD Direct GB/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128 x 64KB | 8MB | 8.10 | 10.66 | 6.24 | 6.49 |
+| 128 x 128KB | 16MB | 9.81 | 11.45 | 6.44 | 6.79 |
+| 128 x 256KB | 32MB | 10.94 | 11.88 | 6.73 | 6.96 |
+| 128 x 512KB | 64MB | 11.61 | 12.10 | 6.46 | 6.76 |
+| 128 x 1MB | 128MB | 11.98 | 12.23 | 6.10 | 6.56 |
+| 128 x 2MB | 256MB | 12.16 | 12.30 | 6.03 | 6.43 |
+
+### 16.8 按模型档位看搬运时间
+
+下面不是重新跑模型，而是用上面最接近的档位做估算：
+
+- `Qwen2.5 7B` 用 `64KB` 档近似
+- `Llama 3.1 8B / Mistral 7B` 用 `128KB` 档近似
+
+| Model tier | KV size | Memcpy(N) | BatchAsync | GFD Queue | GFD Direct |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen2.5 7B @ 8k | 448 MiB | 58.0 ms | 44.1 ms | 75.3 ms | 72.4 ms |
+| Qwen2.5 7B @ 32k | 1.75 GiB | 232.0 ms | 176.3 ms | 301.1 ms | 289.5 ms |
+| Qwen2.5 7B @ 128k | 7 GiB | 927.9 ms | 705.1 ms | 1204.5 ms | 1158.1 ms |
+| Llama/Mistral @ 8k | 1 GiB | 109.5 ms | 93.8 ms | 166.7 ms | 158.1 ms |
+| Llama/Mistral @ 32k | 4 GiB | 437.8 ms | 375.1 ms | 666.9 ms | 632.5 ms |
+| Llama/Mistral @ 128k | 16 GiB | 1751.3 ms | 1500.4 ms | 2667.7 ms | 2530.2 ms |
+
+### 16.9 这一章的结论
+
+- 这台 `3090` 上，`64KB -> 2MB` 区间里，`BatchAsync` 一直最快
+- `GFD Direct` 没有在这些大 KV chunk 上跑赢 `BatchAsync`
+- `GFD Queue` 也没有在这台机器上体现出 README 里那种大 token 优势
+- 如果只看“模型搬运时间”，本机结果是：`Qwen2.5 7B` 这档比 `Llama/Mistral` 明显更快，原因就是 KV cache 更小
+- 如果只问“GFD 是不是有纯吞吐收益”，这章答案是否定的；它的意义更多还是：
+  - 支持 GPU 发起 / queue 模式
+  - 支持 scatter-gather 和更复杂的搬运路径
+  - 给后续 overlap / pipeline 实验留接口
+
+## 17. 追加验证：提高 num_tokens / 随机地址 / 严格绑核
+
+为了验证前面那几个猜想，我给 `examples/04_benchmark.cu` 加了 4 个实验开关：
+
+- `GFD_LARGE_SWEEP_NUM_TOKENS`
+- `GFD_LARGE_SWEEP_TOKEN_SIZES`
+- `GFD_RANDOMIZE_ADDRS`
+- `GFD_STRICT_BIND`
+
+这几个开关默认都不影响原 benchmark 行为，只用于追加 sweep。
+
+### 17.1 这组实验怎么测
+
+目标拆成 3 个角度：
+
+1. `num_tokens` 提高到 `512` / `1024`，看 `GFD Direct` 进 pipeline 分支后有没有明显收益
+2. 把规则 `2x stride` 地址换成随机 slot，看看 `BatchAsync` 会不会更吃亏
+3. 把 benchmark 主线程固定绑到 `CPU 31`，和 `poller/gather worker` 分开，看看 CPU 干扰是不是主因
+
+说明：
+
+- 随机地址不是“完全任意字节地址”，而是在 pinned host buffer 里，从 `2N` 个对齐 slot 中随机选 `N` 个
+- 这样不会破坏正确性，但可以去掉规则 stride 带来的顺序性
+- 所有测试仍然是单卡 `CUDA_VISIBLE_DEVICES=0`
+- 为了控制内存占用，这里把最大 `total transfer` 约束在 `256MB`
+
+### 17.2 实验命令
+
+`512 tokens, regular stride`
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=512 \
+GFD_LARGE_SWEEP_TOKEN_SIZES=64KB,128KB,256KB,512KB \
+./build/gfd_benchmark
+```
+
+`1024 tokens, regular stride`
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=1024 \
+GFD_LARGE_SWEEP_TOKEN_SIZES=64KB,128KB,256KB \
+./build/gfd_benchmark
+```
+
+`1024 tokens, random slots`
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=1024 \
+GFD_LARGE_SWEEP_TOKEN_SIZES=64KB,128KB,256KB \
+GFD_RANDOMIZE_ADDRS=1 \
+./build/gfd_benchmark
+```
+
+`1024 tokens, random slots + strict bind`
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=1024 \
+GFD_LARGE_SWEEP_TOKEN_SIZES=64KB,128KB,256KB \
+GFD_RANDOMIZE_ADDRS=1 \
+GFD_STRICT_BIND=1 \
+./build/gfd_benchmark
+```
+
+对应日志：
+
+- `exp_20260526_tokens512_stride.log`
+- `exp_20260526_tokens1024_stride.log`
+- `exp_20260526_tokens1024_random.log`
+- `exp_20260526_tokens1024_random_strictbind.log`
+
+### 17.3 结果汇总
+
+先只看 `GFD Direct` 带宽，方便判断这 3 个角度有没有把它拉起来：
+
+| Config | 64KB | 128KB | 256KB | 512KB |
+| --- | ---: | ---: | ---: | ---: |
+| 128 tokens, stride | 6.49 | 6.79 | 6.96 | 6.76 |
+| 512 tokens, stride | 9.38 | 8.47 | 7.97 | 7.79 |
+| 1024 tokens, stride | 8.55 | 7.97 | 7.84 | - |
+| 1024 tokens, random | 8.67 | 7.91 | 7.84 | - |
+| 1024 tokens, random + strict bind | 8.71 | 7.94 | 7.83 | - |
+
+同样位置下的 `BatchAsync`：
+
+| Config | 64KB | 128KB | 256KB | 512KB |
+| --- | ---: | ---: | ---: | ---: |
+| 128 tokens, stride | 10.66 | 11.45 | 11.88 | 12.10 |
+| 512 tokens, stride | 10.97 | 11.61 | 11.97 | 12.16 |
+| 1024 tokens, stride | 10.98 | 11.63 | 11.98 | - |
+| 1024 tokens, random | 10.98 | 11.62 | 11.97 | - |
+| 1024 tokens, random + strict bind | 10.98 | 11.63 | 11.98 | - |
+
+### 17.4 这 3 个角度分别说明什么
+
+`1. 提高 num_tokens`
+
+- 这个角度是有用的
+- `128 -> 512 tokens` 后，`64KB` 档 `GFD Direct` 从 `6.49` 提到 `9.38 GB/s`
+- 说明 `count >= 512` 以后，`Direct` 的 pipeline 分支确实开始发挥作用
+- 但再从 `512 -> 1024` 没继续涨，反而略回落到 `8.55 GB/s`
+- 结论：`GFD` 原先差，不是单纯因为 `128 tokens` 太少；条目数补够后，还是没有超过 `BatchAsync`
+
+`2. 随机地址`
+
+- 这个角度基本没改变结论
+- `1024 x 64KB` 下，`BatchAsync` 还是 `10.98 GB/s`
+- `GFD Direct` 只从 `8.55` 变到 `8.67 GB/s`
+- 说明这里这版“随机 slot”还不足以把 CUDA 的 batch 路径打崩
+- 也说明本机主要矛盾不是“规则 stride 对 BatchAsync 过于友好”
+
+`3. 严格绑核`
+
+- 这个角度也只带来非常小的变化
+- `1024 x 64KB` 下，`GFD Direct` 从 `8.67` 到 `8.71 GB/s`
+- `128KB / 256KB` 基本不变
+- 说明 benchmark 主线程和 poller/gather worker 的 CPU 干扰不是当前主瓶颈
+
+### 17.5 这一组追加实验的结论
+
+- `num_tokens` 提高以后，`GFD Direct` 确实有阶段性改善，说明 pipeline 分支有效
+- 但改善幅度还不够，仍然追不上本机的 `BatchAsync`
+- 随机地址没有显著拉低 `BatchAsync`
+- 严格绑核也没有明显把 `GFD` 再抬上去
+- 所以这台机器上 `GFD` 没拿到优势，主因还是：
+  - `BatchAsync` 在 `64KB+` 这档已经很强
+  - `GFD` 仍然要付 `CPU gather + staging -> GPU` 的额外成本
+  - `3090 + 64C CPU + hugepage=no` 的平台条件不够支持 README 那种结果
+
+### 17.6 最终判断
+
+把第 16 章和第 17 章合起来看，这台机器上的最终结论可以收成 4 条：
+
+1. `GFD` 在本机不是“纯搬运吞吐更高”的方案。
+   在 `64KB+` 这类 KV-cache 大块搬运场景里，`BatchAsync` 一直更快，`GFD Direct` 和 `GFD Queue` 都没有反超。
+
+2. `GFD` 的优势区间仍然存在，但不在这次关心的大 KV 档位。
+   本机前面的小块测试已经说明，`512B ~ 16KB` 这类细粒度 scatter 传输里，`GFD Direct` 仍然明显优于 `Memcpy(N)`，只是到了 `64KB+` 后，CUDA 自带 batch 路径已经把差距补上了。
+
+3. 这轮追加实验基本排除了 3 个“可能只是测法问题”的解释。
+   - 不是因为 `num_tokens=128` 太少；提到 `512/1024` 后，`GFD` 仍没超过 `BatchAsync`
+   - 不是因为地址太规则；换成随机 slot 后，结论基本不变
+   - 不是因为 benchmark 主线程抢核；严格绑核后，结果只发生很小波动
+
+4. 因此，本机上更合理的理解是：
+   - 如果任务只是“把大块 KV cache 从 host 搬到 GPU”，优先看 `BatchAsync`
+   - 如果任务需要 `GPU 发起 / queue 模式 / scatter-gather / 后续 overlap-pipeline`，`GFD` 仍然有价值
+   - `GFD` 在这台机器上的意义更偏“机制能力”和“复杂路径支持”，不是这组实验里的绝对带宽冠军
+
+## 18. Nsight Systems 观测
+
+为了不只看最终带宽，这里再用 `Nsight Systems` 看一次不同路径的消耗分布。
+
+### 18.1 这组 profile 怎么测
+
+为了减少 trace 噪声，我给 benchmark 又补了两个开关：
+
+- `GFD_WARMUP`
+- `GFD_ITERS`
+
+profile 时统一压成：
+
+- `Warmup = 1`
+- `Iterations = 3`
+- 每次只跑单个 config
+
+本节关心的不是初始化开销，而是：
+
+- `Memcpy(N)` 的 API 提交次数有多夸张
+- `BatchAsync` 是不是已经把大块 H2D 合并得很好
+- `GFD Queue` 的等待是不是主要耗在 wait kernel
+- `GFD Direct` 虽然减少了 DMA 提交次数，为什么还是没赢
+
+### 18.2 采样命令
+
+`128 x 128KB, regular stride`
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=128 \
+GFD_LARGE_SWEEP_TOKEN_SIZES=128KB \
+GFD_WARMUP=1 \
+GFD_ITERS=3 \
+nsys profile --trace=cuda,osrt --sample=process-tree --cpuctxsw=process-tree \
+  --force-overwrite true \
+  -o /data1/lmy/gfd/nsys_128_128kb_stride \
+  ./build/gfd_benchmark
+```
+
+`512 x 64KB, regular stride`
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=512 \
+GFD_LARGE_SWEEP_TOKEN_SIZES=64KB \
+GFD_WARMUP=1 \
+GFD_ITERS=3 \
+nsys profile --trace=cuda,osrt --sample=process-tree --cpuctxsw=process-tree \
+  --force-overwrite true \
+  -o /data1/lmy/gfd/nsys_512_64kb_stride \
+  ./build/gfd_benchmark
+```
+
+`1024 x 64KB, random + strict bind`
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=1024 \
+GFD_LARGE_SWEEP_TOKEN_SIZES=64KB \
+GFD_RANDOMIZE_ADDRS=1 \
+GFD_STRICT_BIND=1 \
+GFD_WARMUP=1 \
+GFD_ITERS=3 \
+nsys profile --trace=cuda,osrt --sample=process-tree --cpuctxsw=process-tree \
+  --force-overwrite true \
+  -o /data1/lmy/gfd/nsys_1024_64kb_random_strict \
+  ./build/gfd_benchmark
+```
+
+产物：
+
+- `nsys_128_128kb_stride.nsys-rep`
+- `nsys_512_64kb_stride.nsys-rep`
+- `nsys_1024_64kb_random_strict.nsys-rep`
+
+### 18.3 先看 API 调用次数
+
+只摘最关键的几项：
+
+| Case | `cudaMemcpyAsync` | `cudaMemcpyBatchAsync` | `cuMemcpyHtoDAsync_v2` | `cudaStreamSynchronize` | `cudaDeviceSynchronize` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `128 x 128KB stride` | 512 | 4 | 16 | 8 | 9 |
+| `512 x 64KB stride` | 2048 | 4 | 24 | 8 | 9 |
+| `1024 x 64KB random+bind` | 4096 | 4 | 24 | 8 | 9 |
+
+读法：
+
+- `Memcpy(N)` 路径的 API 提交次数确实爆炸，`1024 x 64KB` 一轮里是 `4096` 次 `cudaMemcpyAsync`
+- `BatchAsync` 一直只有 `4` 次 API 调用，因为这里只有 `1 warmup + 3 iters`
+- `GFD` 侧真正的 CE DMA 提交次数很少，只有 `16/24` 次 `cuMemcpyHtoDAsync_v2`
+
+这说明一件事：
+
+- `GFD` 的确成功把“很多小提交”压成了“很少的大提交”
+- 但即使这样，它仍然没赢，所以瓶颈已经不在“DMA API 提交次数”本身
+
+### 18.4 再看 GPU 上的 H2D 形态
+
+`cuda_gpu_mem_size_sum` 里，H2D memop 的最大单次大小分别是：
+
+| Case | H2D op count | Total H2D MB | Max H2D MB |
+| --- | ---: | ---: | ---: |
+| `128 x 128KB stride` | 534 | 281.029 | 16.777 |
+| `512 x 64KB stride` | 2078 | 549.470 | 33.554 |
+| `1024 x 64KB random+bind` | 4126 | 1086.349 | 67.109 |
+
+这里最重要的不是总数，而是 `Max H2D MB`：
+
+- `16.777 MB`
+- `33.554 MB`
+- `67.109 MB`
+
+这说明：
+
+- `GFD` 路径确实在发大块合并 DMA
+- `num_tokens` 提高后，单次大 DMA 也确实在变大
+- 所以“GFD 没有做出大块 coalesced H2D”这个怀疑，可以排除
+
+### 18.5 Queue 路径：wait kernel 才是大头
+
+`cuda_kern_exec_sum` 里两个 kernel 很清楚：
+
+- `bench_gfd_submit_kernel`
+- `bench_gfd_wait_kernel`
+
+3 个 case 下，`submit kernel` 平均总时间大约是：
+
+- `0.178 ms`
+- `0.193 ms`
+- `0.226 ms`
+
+而 `wait kernel` 平均总时间大约是：
+
+- `2.10 ms`
+- `3.36 ms`
+- `6.02 ms`
+
+也就是说：
+
+- `GFD Queue` 慢，不是 GPU 写 descriptor 慢
+- 主要是 GPU 后面一直在等 CPU poller + gather + DMA 完成
+- 所以 queue 模式在这个纯搬运 benchmark 里天然吃亏
+
+### 18.6 Direct 路径：DMA 提交不贵，贵的是 CPU 侧 staging/gather
+
+`cuda_api_sum` 里，`GFD` 对应的 `cuMemcpyHtoDAsync_v2` 平均 CPU API 时间只有：
+
+- `26.8 us`
+- `19.5 us`
+- `24.8 us`
+
+这个量级并不大。
+
+反过来看：
+
+- `BatchAsync` 每次 API 调用虽然更重，但一共只有 `4` 次
+- `GFD Direct` 的 CE 提交次数也很少，但最终 wall time 还是更长
+
+结合代码路径，可以得到更合理的解释：
+
+- `Direct` 真正贵的不是 `cuMemcpyHtoDAsync_v2`
+- 而是 `CPU gather -> staging buffer -> GPU DMA` 这一段主机侧工作
+- 这部分在 `nsys` 里不会像 CUDA API 那样直接给出一个漂亮的单行汇总，但从“DMA 提交很少 yet 总耗时更长”这个现象，已经能反推出它是主要成本
+
+### 18.7 Nsight 这一章的结论
+
+- `nsys` 证明了：`GFD` 确实把大量离散提交压成了少量大 DMA，这一点没有问题
+- `nsys` 也证明了：`GFD Queue` 的主要时间不在 submit kernel，而在后续等待
+- `nsys` 还说明：`GFD Direct` 的 CE 提交 API 自身并不贵，真正拖后腿的是 CPU 侧 gather/staging
+- 因此，本机上 `GFD` 没赢，不是因为“它没有合并提交”，而是因为：
+  - `BatchAsync` 对 `64KB+` 大块 H2D 已经足够强
+  - `GFD` 额外多了一段主机侧数据重排成本
+  - 这段成本在 `3090 + 64C + hugepage=no` 这台机器上没有被摊平
+
+### 18.8 一句话总结
+
+这组 `nsys` 结果可以再压缩成一句更直接的话：
+
+- `GFD` 的“合并提交”本身没有问题
+- 在 `1024 x 64KB` 这类 case 下，`Memcpy(N)` 是 `4096` 次 `cudaMemcpyAsync`，`BatchAsync` 是 `4` 次 API 调用，`GFD` 的 CE 提交只有 `24` 次
+- `GFD Queue` 慢，不是 `submit kernel` 慢；`submit kernel` 大约只有 `0.18 ~ 0.23 ms`，而 `wait kernel` 在 `2.10 ~ 6.02 ms`
+- `GFD Direct` 也不是慢在 DMA API 提交；`cuMemcpyHtoDAsync_v2` 平均只有 `19 ~ 27 us`
+- 真正没有被摊平的，是 `CPU gather -> staging -> GPU DMA` 这一段主机侧成本
+
+因此，这台 `3090 + 64C + hugepage=no` 机器上的最终判断是：
+
+- `BatchAsync` 对 `64KB+` 大块 H2D 已经足够强
+- `GFD` 的额外 gather/staging 成本没有被覆盖掉
+- 所以本机上 `GFD` 不是这组大 KV-cache 搬运实验里的绝对带宽最优解
+
+## 19. 开启 HugeTLB 后重刷
+
+宿主机执行：
+
+```bash
+echo 2048 | sudo tee /proc/sys/vm/nr_hugepages
+```
+
+之后检查到：
+
+- `HugePages_Total = 2048`
+- `HugePages_Free = 2048`
+- `Hugepagesize = 2048 kB`
+- NUMA 上为 `node0=1024`、`node1=1024`
+
+更关键的是，GFD 运行日志已经明确变成：
+
+- `Pre-allocated ... (hugepage=yes)`
+- `Staging from pool: ... (hugepage=yes, NUMA 0)`
+
+说明这次不是“系统有大页但程序没吃到”，而是 `GFD` 的 staging buffer 已经真实命中了 `HugeTLB`。
+
+### 19.1 这组实验怎么测
+
+为了只回答“大页本身有没有把结论翻过来”，这里重刷 4 个关键 case：
+
+- `128 x 64KB, stride`
+- `512 x 64KB, stride`
+- `1024 x 64KB, stride`
+- `1024 x 64KB, random + strict bind`
+
+日志：
+
+- `hugepage_rerun_128_64kb.log`
+- `hugepage_rerun_512_64kb.log`
+- `hugepage_rerun_1024_64kb_stride.log`
+- `hugepage_rerun_1024_64kb_random_strict.log`
+
+### 19.2 hugepage=yes 后的结果
+
+| Case | BatchAsync GB/s | GFD Queue GB/s | GFD Direct GB/s |
+| --- | ---: | ---: | ---: |
+| `128 x 64KB, stride` | 10.87 | 6.30 | 7.55 |
+| `512 x 64KB, stride` | 10.97 | 6.27 | 9.27 |
+| `1024 x 64KB, stride` | 10.95 | 4.64 | 7.40 |
+| `1024 x 64KB, random + strict` | 10.97 | 5.01 | 8.40 |
+
+和之前 `hugepage=no` 的同档位对比：
+
+| Case | BatchAsync | GFD Queue | GFD Direct |
+| --- | ---: | ---: | ---: |
+| `128 x 64KB, stride` | `10.66 -> 10.87` | `6.24 -> 6.30` | `6.49 -> 7.55` |
+| `512 x 64KB, stride` | `10.97 -> 10.97` | `6.52 -> 6.27` | `9.38 -> 9.27` |
+| `1024 x 64KB, stride` | `10.98 -> 10.95` | `6.01 -> 4.64` | `8.55 -> 7.40` |
+| `1024 x 64KB, random + strict` | `10.98 -> 10.97` | `6.13 -> 5.01` | `8.71 -> 8.40` |
+
+### 19.3 这组重刷说明什么
+
+- `HugeTLB` 确实已经启用，而且 `GFD` 也确实已经用上了
+- 但它没有把最终结论翻过来
+- 只在最小的 `128 x 64KB` case 上，`GFD Direct` 有一档比较明显的回升：`6.49 -> 7.55 GB/s`
+- 到了 `512 x 64KB`，`GFD Direct` 基本持平
+- 到了 `1024 x 64KB`，`GFD Direct` 和 `GFD Queue` 都没有继续改善，反而略低于之前那组结果
+
+### 19.4 最终结论
+
+这组 `hugepage=yes` 重刷，能得出两个明确判断：
+
+1. 之前文档里的 `hugepage=no`，确实只是“当时还没命中大页路径”，不是日志误报。
+2. 即使 `GFD` 现在已经真实使用 `HugeTLB`，本机上它仍然没有在 `64KB` 这档大 KV-cache 搬运里反超 `BatchAsync`。
+
+所以本机的最终结论不变：
+
+- 开启大页是正确动作，至少把环境补齐了
+- 但大页不是决定性瓶颈
+- `BatchAsync` 在这台 `3090` 上对 `64KB+` 大块 H2D 仍然更强
+- `GFD` 的主要价值仍然是 `queue / scatter-gather / overlap-pipeline` 这些复杂路径，而不是这组纯搬运测试里的绝对带宽第一
+
+## 20. 继续往 64KB 以下看
+
+上面几章已经说明：在 `64KB` 这一档，本机上 `BatchAsync` 仍然明显强于 `GFD`。为了进一步回答“如果比 `64KB` 更小，结论会不会变好”，这里重新跑了一次标准单卡 benchmark，并只看 `Group B` 里的：
+
+- `2048 x 8KB`
+- `2048 x 16KB`
+- `2048 x 32KB`
+- `2048 x 64KB`
+
+这次环境已经是：
+
+- `hugepage=yes`
+- regular `2x stride`
+- 标准 `Group B` 路径
+
+日志：
+
+- `hugepage_full_benchmark_20260526_rerun.log`
+
+### 20.1 结果
+
+| Config | Memcpy(N) GB/s | BatchAsync GB/s | GFD Queue GB/s | GFD Direct GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| `2048 x 8KB` | 2.74 | 3.12 | 5.48 | 9.47 |
+| `2048 x 16KB` | 4.20 | 3.69 | 4.71 | 8.47 |
+| `2048 x 32KB` | 6.05 | 9.89 | 4.63 | 7.71 |
+| `2048 x 64KB` | 8.40 | 10.99 | 5.04 | 7.72 |
+
+### 20.2 读法
+
+- 到了 `8KB`，`GFD Direct` 已经明显回到优势区，`9.47 GB/s` 高于 `BatchAsync 3.12 GB/s`
+- 到了 `16KB`，`GFD Direct` 仍然是最强，`8.47 GB/s` 高于 `Memcpy(N) 4.20 GB/s` 和 `BatchAsync 3.69 GB/s`
+- 到了 `32KB`，拐点出现，`BatchAsync 9.89 GB/s` 已经重新反超 `GFD Direct 7.71 GB/s`
+- 到了 `64KB`，这个差距继续拉大，`BatchAsync 10.99 GB/s`，`GFD Direct 7.72 GB/s`
+
+### 20.3 这一章的结论
+
+如果把“更小的 token”也纳入结论，本机上可以更精确地划出一个分界：
+
+- `8KB ~ 16KB`：`GFD Direct` 仍然有明显优势
+- `32KB`：开始进入 `BatchAsync` 更强的区间
+- `64KB`：已经比较明确是 `BatchAsync` 主场
+
+所以，“往 64KB 以下看会不会更好”这个问题，答案是：
+
+- 会，而且在本机上是很明显的改善
+- 但这个改善主要发生在 `8KB/16KB` 这两档
+- 一旦接近 `32KB` 甚至到 `64KB`，`BatchAsync` 又会重新占优
+
+## 21. 切到 GPU4 重跑
+
+为了确认这些结论是不是只在 `GPU0` 上成立，我又把单卡 benchmark 和 large sweep 切到 `GPU4` 重新跑了一遍。
+
+日志：
+
+- `gpu4_full_benchmark_20260526.log`
+- `gpu4_large_sweep_20260526.log`
+
+### 21.1 先说一个限制
+
+这个单卡 benchmark 有个实现细节要先说清楚：
+
+- `examples/04_benchmark.cu` 里，单卡 `CpuPollingThread` 仍然写死为 `numa_node=0`
+- 同时 `exclusive_core_base=0`、`exclusive_core_count=32`
+
+也就是说，即使切到 `CUDA_VISIBLE_DEVICES=4`，这版 benchmark 仍然在按 `NUMA0` 的 poller/staging/绑核方式跑，而不是按 `GPU4` 所在 NUMA 节点做本地化设置。
+
+所以这一章的意义是：
+
+- 看“换卡后结论会不会翻”
+- 不是给 `GPU4` 做最优 NUMA 调参后的极限成绩
+
+### 21.2 GPU4 标准 benchmark 结果
+
+先只摘最关键的 `Group B`：
+
+| Config | BatchAsync GB/s | GFD Queue GB/s | GFD Direct GB/s |
+| --- | ---: | ---: | ---: |
+| `2048 x 8KB` | 3.18 | 5.51 | 9.33 |
+| `2048 x 16KB` | 3.77 | 4.86 | 8.65 |
+| `2048 x 32KB` | 9.90 | 4.61 | 8.11 |
+| `2048 x 64KB` | 10.98 | 4.81 | 7.95 |
+
+和 `GPU0` 对照：
+
+| Config | GPU0 GFD Direct | GPU4 GFD Direct | GPU0 BatchAsync | GPU4 BatchAsync |
+| --- | ---: | ---: | ---: | ---: |
+| `2048 x 8KB` | 9.47 | 9.33 | 3.12 | 3.18 |
+| `2048 x 16KB` | 8.47 | 8.65 | 3.69 | 3.77 |
+| `2048 x 32KB` | 7.71 | 8.11 | 9.89 | 9.90 |
+| `2048 x 64KB` | 7.72 | 7.95 | 10.99 | 10.98 |
+
+这组结果说明：
+
+- `8KB ~ 16KB` 仍然是 `GFD Direct` 优势区
+- `32KB` 开始，`BatchAsync` 仍然重新反超
+- `64KB` 仍然是 `BatchAsync` 主场
+
+也就是说，切到 `GPU4` 后，分界线没有变化。
+
+### 21.3 GPU4 large sweep 结果
+
+`GPU4` 上 `128 x {64KB,128KB,256KB,512KB,1MB,2MB}` 的带宽：
+
+| Config | BatchAsync GB/s | GFD Queue GB/s | GFD Direct GB/s |
+| --- | ---: | ---: | ---: |
+| `128 x 64KB` | 10.88 | 6.43 | 7.21 |
+| `128 x 128KB` | 11.56 | 6.06 | 6.55 |
+| `128 x 256KB` | 11.94 | 5.22 | 5.51 |
+| `128 x 512KB` | 12.14 | 5.06 | 5.57 |
+| `128 x 1MB` | 12.25 | 5.18 | 5.85 |
+| `128 x 2MB` | 12.30 | 5.53 | 5.76 |
+
+和 `GPU0` 对照后，可以看到：
+
+- `BatchAsync` 基本不变
+- `GFD Direct` 在 `64KB` 以上整体没有变好，很多档位还略低
+- `GFD Queue` 在大于等于 `128KB` 的档位也没有表现出更强趋势
+
+### 21.4 这一章的结论
+
+切到 `GPU4` 以后，本机结论没有发生本质变化：
+
+- `8KB ~ 16KB`：`GFD Direct` 仍然更强
+- `32KB`：仍然是拐点
+- `64KB+`：仍然是 `BatchAsync` 更强
+
+换句话说：
+
+- 这些结论不是 `GPU0` 特例
+- 至少在 `GPU4` 上也能复现同样的趋势
+- 即使考虑到 `GPU4` 这组测法还不是严格 NUMA-local，它也没有出现“GFD 全面翻盘”的迹象

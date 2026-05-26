@@ -48,17 +48,6 @@ struct GPUConfig {
     int core_count;
 };
 
-static GPUConfig gpu_configs[MAX_GPUS] = {
-    { 0, 0,  0, 16 },
-    { 1, 0, 16, 16 },
-    { 2, 0, 32, 16 },
-    { 3, 0, 48, 16 },
-    { 4, 1, 64, 16 },
-    { 5, 1, 80, 16 },
-    { 6, 1, 96, 16 },
-    { 7, 1, 112, 16 },
-};
-
 // Per-GPU resources
 struct GPUContext {
     CUcontext       cu_ctx;
@@ -194,6 +183,15 @@ int main() {
     printf("Max per-GPU transfer: %zu MB, Max CPU buffer: %zu MB\n\n",
            max_total / (1024*1024), max_cpu / (1024*1024));
 
+    auto topo = gfd::discover_topology(num_gpus);
+    gfd::print_topology(topo);
+    std::vector<GPUConfig> gpu_configs(num_gpus);
+    for (int i = 0; i < num_gpus; i++) {
+        int base_cpu = 0, num_cores = 1, stride = 1;
+        topo.get_exclusive_cores(i, base_cpu, num_cores, stride);
+        gpu_configs[i] = { i, topo.gpus[i].numa_node, base_cpu, num_cores };
+    }
+
     // ---- Initialize GPUs ----
     std::vector<GPUContext> contexts(num_gpus);
 
@@ -232,12 +230,13 @@ int main() {
         memset(ctx.queue, 0, sizeof(gfd::DescriptorQueue));
 
         // Poller (no shared pool → self-allocates NUMA-local staging)
+        int poller_core_count = std::max(1, gcfg.core_count - 1);
         ctx.poller = new gfd::CpuPollingThread(
             ctx.queue, ctx.gpu_buf, ctx.cpu_buf, max_total,
             /*use_ce=*/true, /*numa_node=*/gcfg.numa_node,
             /*core_offset=*/0, /*num_ce_channels=*/0,
             /*exclusive_core_base=*/gcfg.core_base,
-            /*exclusive_core_count=*/gcfg.core_count);
+            /*exclusive_core_count=*/poller_core_count);
 
         if (!ctx.poller->init_copy_engine()) {
             fprintf(stderr, "GPU %d: Failed to init copy engine\n", i);

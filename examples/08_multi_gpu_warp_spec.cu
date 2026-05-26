@@ -191,17 +191,14 @@ int main() {
            1 + CHUNKS_PER_TILE, block_size);
     printf("Warmup: %d, Iterations: %d\n\n", WARMUP, ITERS);
 
-    // NUMA topology: 4 GPUs per NUMA node, 16 cores per GPU
-    GPUConfig gpu_configs[MAX_GPUS] = {
-        { 0, 0,  0, 16 },
-        { 1, 0, 16, 16 },
-        { 2, 0, 32, 16 },
-        { 3, 0, 48, 16 },
-        { 4, 1, 64, 16 },
-        { 5, 1, 80, 16 },
-        { 6, 1, 96, 16 },
-        { 7, 1, 112, 16 },
-    };
+    auto topo = gfd::discover_topology(num_gpus);
+    gfd::print_topology(topo);
+    std::vector<GPUConfig> gpu_configs(num_gpus);
+    for (int i = 0; i < num_gpus; i++) {
+        int base_cpu = 0, num_cores = 1, stride = 1;
+        topo.get_exclusive_cores(i, base_cpu, num_cores, stride);
+        gpu_configs[i] = { i, topo.gpus[i].numa_node, base_cpu, num_cores };
+    }
 
     // ---- Initialize all GPUs ----
     std::vector<GPUState> states(num_gpus);
@@ -267,12 +264,13 @@ int main() {
         gfd::StagingPool::instance().init(1, TOTAL_SIZE);
 
         // CpuPollingThread with exclusive NUMA-local cores
+        int poller_core_count = std::max(1, cfg.core_count - 1);
         st.poller = new gfd::CpuPollingThread(
             &st.tq->base, st.gpu_data, st.cpu_data, TOTAL_SIZE,
             /*use_ce=*/true, /*numa_node=*/cfg.numa_node,
             /*core_offset=*/0, /*num_ce_channels=*/0,
             /*exclusive_core_base=*/cfg.core_base,
-            /*exclusive_core_count=*/cfg.core_count);
+            /*exclusive_core_count=*/poller_core_count);
         st.poller->set_tiled_queue(st.tq);
 
         if (!st.poller->init_copy_engine()) {

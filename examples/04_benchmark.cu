@@ -74,6 +74,26 @@ static TimingStats compute_stats(std::vector<double>& v) {
     return { percentile(v, 50), percentile(v, 90) };
 }
 
+static cudaError_t memcpy_batch_async_compat(
+    void** dsts,
+    const void** srcs,
+    size_t* sizes,
+    size_t count,
+    cudaMemcpyAttributes* attr,
+    size_t* attr_idxs,
+    size_t num_attrs,
+    cudaStream_t stream)
+{
+#if CUDART_VERSION >= 12090
+    size_t fail_idx = 0;
+    return cudaMemcpyBatchAsync(
+        dsts, srcs, sizes, count, attr, attr_idxs, num_attrs, &fail_idx, stream);
+#else
+    return cudaMemcpyBatchAsync(
+        dsts, srcs, sizes, count, attr, attr_idxs, num_attrs, stream);
+#endif
+}
+
 static const char* fmt_size(size_t bytes, char* buf, size_t buflen) {
     if (bytes >= 1024 * 1024)
         snprintf(buf, buflen, "%zuMB", bytes / (1024 * 1024));
@@ -86,22 +106,24 @@ static const char* fmt_size(size_t bytes, char* buf, size_t buflen) {
 
 // ---- Benchmark routines ----
 
-static constexpr int WARMUP = 15;
-static constexpr int ITERS = 50;
+static constexpr int WARMUP_DEFAULT = 15;
+static constexpr int ITERS_DEFAULT = 50;
+static int g_warmup = WARMUP_DEFAULT;
+static int g_iters = ITERS_DEFAULT;
 
 static TimingStats bench_memcpy_per_token(
     void* gpu_dst, const uint64_t* cpu_addrs,
     int num_tokens, size_t token_size, cudaStream_t stream)
 {
-    for (int i = 0; i < WARMUP; i++) {
+    for (int i = 0; i < g_warmup; i++) {
         for (int t = 0; t < num_tokens; t++)
             cudaMemcpyAsync((char*)gpu_dst + (size_t)t * token_size,
                             (const void*)cpu_addrs[t], token_size,
                             cudaMemcpyHostToDevice, stream);
         cudaStreamSynchronize(stream);
     }
-    std::vector<double> times(ITERS);
-    for (int i = 0; i < ITERS; i++) {
+    std::vector<double> times(g_iters);
+    for (int i = 0; i < g_iters; i++) {
         auto t0 = std::chrono::high_resolution_clock::now();
         for (int t = 0; t < num_tokens; t++)
             cudaMemcpyAsync((char*)gpu_dst + (size_t)t * token_size,
@@ -136,21 +158,17 @@ static TimingStats bench_memcpy_batch(
     // All entries share the same attribute (index 0)
     std::vector<size_t> attrIdxs(num_tokens, 0);
 
-    for (int i = 0; i < WARMUP; i++) {
-        cudaMemcpyBatchAsync(
-            (void* const*)dsts.data(),
-            (const void* const*)srcs.data(),
-            sizes.data(), num_tokens,
+    for (int i = 0; i < g_warmup; i++) {
+        memcpy_batch_async_compat(
+            dsts.data(), srcs.data(), sizes.data(), num_tokens,
             &attr, attrIdxs.data(), 1, stream);
         cudaStreamSynchronize(stream);
     }
-    std::vector<double> times(ITERS);
-    for (int i = 0; i < ITERS; i++) {
+    std::vector<double> times(g_iters);
+    for (int i = 0; i < g_iters; i++) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        cudaMemcpyBatchAsync(
-            (void* const*)dsts.data(),
-            (const void* const*)srcs.data(),
-            sizes.data(), num_tokens,
+        memcpy_batch_async_compat(
+            dsts.data(), srcs.data(), sizes.data(), num_tokens,
             &attr, attrIdxs.data(), 1, stream);
         cudaStreamSynchronize(stream);
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -168,15 +186,15 @@ static TimingStats bench_gfd_queue(
     int threads = 256;
     int blocks = (num_tokens + threads - 1) / threads;
 
-    for (int i = 0; i < WARMUP; i++) {
+    for (int i = 0; i < g_warmup; i++) {
         bench_gfd_submit_kernel<<<blocks, threads>>>(
             queue, d_tokens, gpu_dst, num_tokens, token_size, base_slot);
         base_slot += num_tokens;
         bench_gfd_wait_kernel<<<1, 1>>>(queue, base_slot);
         cudaDeviceSynchronize();
     }
-    std::vector<double> times(ITERS);
-    for (int i = 0; i < ITERS; i++) {
+    std::vector<double> times(g_iters);
+    for (int i = 0; i < g_iters; i++) {
         auto t0 = std::chrono::high_resolution_clock::now();
         bench_gfd_submit_kernel<<<blocks, threads>>>(
             queue, d_tokens, gpu_dst, num_tokens, token_size, base_slot);
@@ -194,10 +212,10 @@ static TimingStats bench_gfd_direct(
     gfd::CpuPollingThread& poller,
     const gfd::SGEntry* entries, int count)
 {
-    for (int i = 0; i < WARMUP; i++)
+    for (int i = 0; i < g_warmup; i++)
         poller.submit_direct(entries, count);
-    std::vector<double> times(ITERS);
-    for (int i = 0; i < ITERS; i++)
+    std::vector<double> times(g_iters);
+    for (int i = 0; i < g_iters; i++)
         times[i] = poller.submit_direct(entries, count);
     return compute_stats(times);
 }
@@ -314,6 +332,26 @@ int main() {
     };
     int nc = sizeof(group_c) / sizeof(group_c[0]);
 
+    // Large-sweep mode: fixed token count, vary token_size above 64KB
+    Config group_large[] = {
+        {  128,   65536 },
+        {  128,  131072 },
+        {  128,  262144 },
+        {  128,  524288 },
+        {  128, 1048576 },
+        {  128, 2097152 },
+    };
+    int nl = sizeof(group_large) / sizeof(group_large[0]);
+
+    bool large_sweep = false;
+    if (const char* env = getenv("GFD_LARGE_SWEEP")) {
+        large_sweep = env[0] != '\0' && env[0] != '0';
+    }
+    if (large_sweep) {
+        g_warmup = 5;
+        g_iters = 20;
+    }
+
     // Group B: vary token_size (fixed num_tokens = 2048)
     Config group_b[] = {
         { 2048,    512 },
@@ -329,9 +367,13 @@ int main() {
 
     // Merge all configs for allocation sizing
     std::vector<Config> all_configs;
-    for (int i = 0; i < na; i++) all_configs.push_back(group_a[i]);
-    for (int i = 0; i < nb; i++) all_configs.push_back(group_b[i]);
-    for (int i = 0; i < nc; i++) all_configs.push_back(group_c[i]);
+    if (large_sweep) {
+        for (int i = 0; i < nl; i++) all_configs.push_back(group_large[i]);
+    } else {
+        for (int i = 0; i < na; i++) all_configs.push_back(group_a[i]);
+        for (int i = 0; i < nb; i++) all_configs.push_back(group_b[i]);
+        for (int i = 0; i < nc; i++) all_configs.push_back(group_c[i]);
+    }
 
     constexpr int SCATTER_STRIDE = 2;
     size_t max_total = 0, max_cpu_buf = 0;
@@ -342,6 +384,9 @@ int main() {
         if (total > max_total) max_total = total;
         if (cpu > max_cpu_buf) max_cpu_buf = cpu;
         if (cfg.num_tokens > max_num_tokens) max_num_tokens = cfg.num_tokens;
+    }
+    if (large_sweep && max_num_tokens < 512) {
+        max_num_tokens = 512;
     }
 
     // ---- Allocate resources ----
@@ -389,6 +434,7 @@ int main() {
     {
         int gwN = 512;
         int gwT = 4096;
+        int gw_iters = large_sweep ? 5 : 30;
         size_t gw_stride = (size_t)gwT * SCATTER_STRIDE;
         for (int i = 0; i < gwN; i++) {
             h_cpu_addrs[i] = (uint64_t)(cpu_buf + (size_t)i * gw_stride);
@@ -404,7 +450,9 @@ int main() {
 
         int threads = 256;
         int blocks = (gwN + threads - 1) / threads;
-        for (int i = 0; i < 30; i++) {
+        printf("Global warmup: %d x %dx%dB\n", gw_iters, gwN, gwT);
+        fflush(stdout);
+        for (int i = 0; i < gw_iters; i++) {
             bench_gfd_submit_kernel<<<blocks, threads>>>(
                 d_queue, d_tokens, gpu_buf, gwN, gwT, gfd_base_slot);
             gfd_base_slot += gwN;
@@ -412,7 +460,7 @@ int main() {
             cudaDeviceSynchronize();
         }
         poller.submit_direct(h_sg_entries.data(), gwN);
-        printf("Global warmup done (30 x 512x4KB)\n");
+        printf("Global warmup done (%d x %dx%dB)\n", gw_iters, gwN, gwT);
     }
 
     // ---- Run all configs, collect results ----
@@ -451,7 +499,47 @@ int main() {
     printf("Max total transfer: %zu MB, Max CPU buffer: %zu MB\n",
            max_total / (1024 * 1024), max_cpu_buf / (1024 * 1024));
     printf("Scattered layout: tokens at %dx stride in pinned CPU memory\n", SCATTER_STRIDE);
-    printf("Warmup: %d, Iterations: %d\n", WARMUP, ITERS);
+    printf("Warmup: %d, Iterations: %d\n", g_warmup, g_iters);
+
+    if (large_sweep) {
+        printf("\nRunning Large Sweep: vary token_size (num_tokens = 128) ...\n");
+        fflush(stdout);
+
+        std::vector<Result> results_large;
+        for (int i = 0; i < nl; i++) {
+            results_large.push_back(run_config(group_large[i]));
+            char sz[16];
+            fmt_size(group_large[i].token_bytes, sz, sizeof(sz));
+            printf("  [%d/%d] 128 x %s done\n", i + 1, nl, sz);
+            fflush(stdout);
+        }
+
+        printf("\n");
+        printf("================================================================\n");
+        printf("  Large Sweep: Vary token_size (num_tokens = 128)\n");
+        printf("================================================================\n");
+
+        printf("\n  [Latency P50 (us)]\n\n");
+        print_latency_table(results_large, "P50 us", &TimingStats::p50);
+        printf("\n  [Bandwidth (from P50 latency)]\n\n");
+        print_bandwidth_table(results_large);
+
+        printf("\n");
+        printf("Legend:\n");
+        printf("  Memcpy(N)   : N individual cudaMemcpyAsync from scattered CPU addresses\n");
+        printf("  BatchAsync  : cudaMemcpyBatchAsync (single API call, N transfers)\n");
+        printf("  GFD Queue   : GPU submit descriptors (fire-and-forget) + wait kernel\n");
+        printf("  GFD Direct  : CPU direct-submit, bypass queue (parallel gather)\n");
+
+        poller.stop();
+        gfd::StagingPool::instance().shutdown();
+        cudaStreamDestroy(bench_stream);
+        cudaFree(d_tokens);
+        cudaFree(d_queue);
+        cudaFree(gpu_buf);
+        cudaFreeHost(cpu_buf);
+        return 0;
+    }
 
     // ---- Group A ----
     printf("\nRunning Group A: vary num_tokens (token_size = 4KB) ...\n");
@@ -538,4 +626,3 @@ int main() {
 
     return 0;
 }
-

@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <utility>
 #include <vector>
 
 #ifdef __linux__
@@ -41,24 +43,43 @@ struct TopologyConfig {
     void get_exclusive_cores(int gpu_id, int& out_base_cpu, int& out_num_cores,
                              int& out_stride) const {
         auto& g = gpus[gpu_id];
-        int numa = g.numa_node;
-        int ngpus_on_numa = gpus_per_numa[numa];
-        int cores_per_gpu = physical_cores_per_numa / ngpus_on_numa;
-
-        int intra_numa_idx = 0;
-        for (int i = 0; i < gpu_id; i++) {
-            if (gpus[i].numa_node == numa) intra_numa_idx++;
-        }
-
         out_stride = 1;
-        out_base_cpu = g.cpu_start + intra_numa_idx * cores_per_gpu;
-        out_num_cores = cores_per_gpu;
-
-        if (out_base_cpu + out_num_cores - 1 > g.cpu_end) {
-            out_num_cores = g.cpu_end - out_base_cpu + 1;
-        }
+        out_base_cpu = g.cpu_start;
+        out_num_cores = g.cpu_end - g.cpu_start + 1;
+        if (out_num_cores < 1) out_num_cores = 1;
     }
 };
+
+static inline std::vector<std::pair<int, int>> parse_cpulist_ranges(const char* text) {
+    std::vector<std::pair<int, int>> ranges;
+    if (!text) return ranges;
+
+    std::string cpulist(text);
+    size_t start = 0;
+    while (start < cpulist.size()) {
+        size_t end = cpulist.find(',', start);
+        std::string token = cpulist.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!token.empty()) {
+            int lo = 0, hi = 0;
+            if (sscanf(token.c_str(), "%d-%d", &lo, &hi) == 2) {
+                ranges.emplace_back(lo, hi);
+            } else if (sscanf(token.c_str(), "%d", &lo) == 1) {
+                ranges.emplace_back(lo, lo);
+            }
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return ranges;
+}
+
+static inline int count_cpulist_ranges(const std::vector<std::pair<int, int>>& ranges) {
+    int total = 0;
+    for (const auto& range : ranges) {
+        total += range.second - range.first + 1;
+    }
+    return total;
+}
 
 static inline TopologyConfig discover_topology(int num_gpus) {
     TopologyConfig topo;
@@ -79,19 +100,22 @@ static inline TopologyConfig discover_topology(int num_gpus) {
     topo.total_numa_nodes = max_numa + 1;
 
     char path[256];
-    snprintf(path, sizeof(path), "/sys/devices/system/node/node0/cpulist");
-    f = fopen(path, "r");
-    int node0_start = 0, node0_end = 63, ht_start = 128;
-    if (f) {
-        char buf[256];
+    std::vector<std::vector<std::pair<int, int>>> node_cpu_ranges(topo.total_numa_nodes);
+    std::vector<int> node_cpu_counts(topo.total_numa_nodes, 0);
+    for (int node = 0; node < topo.total_numa_nodes; node++) {
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+        f = fopen(path, "r");
+        if (!f) continue;
+        char buf[256] = {};
         if (fgets(buf, sizeof(buf), f)) {
-            sscanf(buf, "%d-%d,%d-", &node0_start, &node0_end, &ht_start);
+            node_cpu_ranges[node] = parse_cpulist_ranges(buf);
+            node_cpu_counts[node] = count_cpulist_ranges(node_cpu_ranges[node]);
         }
         fclose(f);
     }
-    int cpus_per_range = node0_end - node0_start + 1;
-    topo.cpus_per_numa = cpus_per_range * 2;
-    topo.physical_cores_per_numa = cpus_per_range;
+
+    topo.cpus_per_numa = node_cpu_counts.empty() ? 0 : node_cpu_counts[0];
+    topo.physical_cores_per_numa = topo.cpus_per_numa > 1 ? topo.cpus_per_numa / 2 : topo.cpus_per_numa;
 
     for (int g = 0; g < num_gpus; g++) {
         topo.gpus[g].gpu_id = g;
@@ -122,12 +146,10 @@ static inline TopologyConfig discover_topology(int num_gpus) {
             gpu_numa = (num_gpus > 1 && g >= num_gpus / 2) ? 1 : 0;
         }
         topo.gpus[g].numa_node = gpu_numa;
-
-        int numa = topo.gpus[g].numa_node;
-        topo.gpus[g].cpu_start = numa * cpus_per_range;
-        topo.gpus[g].cpu_end = (numa + 1) * cpus_per_range - 1;
-        topo.gpus[g].ht_offset = ht_start - node0_start;
-        topo.gpus[g].num_physical_cores = cpus_per_range;
+        topo.gpus[g].cpu_start = 0;
+        topo.gpus[g].cpu_end = 0;
+        topo.gpus[g].ht_offset = 0;
+        topo.gpus[g].num_physical_cores = 1;
         topo.gpus[g].pcie_bus = g;
     }
 #else
@@ -149,6 +171,46 @@ static inline TopologyConfig discover_topology(int num_gpus) {
     for (int g = 0; g < num_gpus; g++) {
         topo.gpus_per_numa[topo.gpus[g].numa_node]++;
     }
+
+#ifdef __linux__
+    for (int node = 0; node < topo.total_numa_nodes; node++) {
+        std::vector<int> gpu_ids;
+        for (int g = 0; g < num_gpus; g++) {
+            if (topo.gpus[g].numa_node == node) gpu_ids.push_back(g);
+        }
+        if (gpu_ids.empty()) continue;
+
+        const auto& ranges = node_cpu_ranges[node];
+        int remaining_cpus = node_cpu_counts[node];
+        size_t range_idx = 0;
+        int cursor = ranges.empty() ? 0 : ranges[0].first;
+
+        for (size_t pos = 0; pos < gpu_ids.size(); pos++) {
+            int gpu_id = gpu_ids[pos];
+            int remaining_gpus = static_cast<int>(gpu_ids.size() - pos);
+            int want = remaining_gpus > 0 ? (remaining_cpus + remaining_gpus - 1) / remaining_gpus : 1;
+
+            while (range_idx < ranges.size() && cursor > ranges[range_idx].second) {
+                range_idx++;
+                if (range_idx < ranges.size()) cursor = ranges[range_idx].first;
+            }
+
+            if (range_idx >= ranges.size()) {
+                topo.gpus[gpu_id].cpu_start = 0;
+                topo.gpus[gpu_id].cpu_end = 0;
+                topo.gpus[gpu_id].num_physical_cores = 1;
+                continue;
+            }
+
+            int take = std::min(want, ranges[range_idx].second - cursor + 1);
+            topo.gpus[gpu_id].cpu_start = cursor;
+            topo.gpus[gpu_id].cpu_end = cursor + take - 1;
+            topo.gpus[gpu_id].num_physical_cores = take;
+            cursor += take;
+            remaining_cpus -= take;
+        }
+    }
+#endif
 
     return topo;
 }

@@ -77,6 +77,26 @@ struct GPUContext {
     cudaMemcpyAttributes     batch_attr;
 };
 
+static cudaError_t memcpy_batch_async_compat(
+    void** dsts,
+    const void** srcs,
+    size_t* sizes,
+    size_t count,
+    cudaMemcpyAttributes* attr,
+    size_t* attr_idxs,
+    size_t num_attrs,
+    cudaStream_t stream)
+{
+#if CUDART_VERSION >= 12090
+    size_t fail_idx = 0;
+    return cudaMemcpyBatchAsync(
+        dsts, srcs, sizes, count, attr, attr_idxs, num_attrs, &fail_idx, stream);
+#else
+    return cudaMemcpyBatchAsync(
+        dsts, srcs, sizes, count, attr, attr_idxs, num_attrs, stream);
+#endif
+}
+
 // ---- Benchmark: cudaMemcpy(N) ----
 static double bench_memcpy_N(GPUContext& ctx) {
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -93,9 +113,8 @@ static double bench_memcpy_N(GPUContext& ctx) {
 // ---- Benchmark: cudaMemcpyBatchAsync (uses pre-allocated arrays) ----
 static double bench_memcpy_batch(GPUContext& ctx) {
     auto t0 = std::chrono::high_resolution_clock::now();
-    cudaMemcpyBatchAsync(
-        (void* const*)ctx.batch_dsts.data(),
-        (const void* const*)ctx.batch_srcs.data(),
+    memcpy_batch_async_compat(
+        ctx.batch_dsts.data(), ctx.batch_srcs.data(),
         ctx.batch_sizes.data(), NUM_TOKENS,
         &ctx.batch_attr, ctx.batch_attr_idxs.data(), 1, ctx.stream);
     cudaStreamSynchronize(ctx.stream);
@@ -176,19 +195,14 @@ int main() {
     }
     printf("\n");
 
-    // NUMA-aware core assignments (16 cores per GPU):
-    // GPU 0-3 (NUMA 0): cores 0-63
-    // GPU 4-7 (NUMA 1): cores 64-127
-    GPUConfig gpu_configs[MAX_GPUS] = {
-        { 0, 0,  0, 16 },
-        { 1, 0, 16, 16 },
-        { 2, 0, 32, 16 },
-        { 3, 0, 48, 16 },
-        { 4, 1, 64, 16 },
-        { 5, 1, 80, 16 },
-        { 6, 1, 96, 16 },
-        { 7, 1, 112, 16 },
-    };
+    auto topo = gfd::discover_topology(num_gpus);
+    gfd::print_topology(topo);
+    std::vector<GPUConfig> gpu_configs(num_gpus);
+    for (int i = 0; i < num_gpus; i++) {
+        int base_cpu = 0, num_cores = 1, stride = 1;
+        topo.get_exclusive_cores(i, base_cpu, num_cores, stride);
+        gpu_configs[i] = { i, topo.gpus[i].numa_node, base_cpu, num_cores };
+    }
 
     // ---- Do NOT use shared StagingPool ----
     // Each poller self-allocates NUMA-local hugepage staging buffers
@@ -265,12 +279,13 @@ int main() {
 
         // Create polling thread:
         // No shared pool → poller will self-allocate NUMA-local hugepage staging
+        int poller_core_count = std::max(1, gcfg.core_count - 1);
         ctx.poller = new gfd::CpuPollingThread(
             ctx.queue, ctx.gpu_buf, ctx.cpu_buf, TOTAL_SIZE,
             /*use_ce=*/true, /*numa_node=*/gcfg.numa_node,
             /*core_offset=*/0, /*num_ce_channels=*/0,
             /*exclusive_core_base=*/gcfg.core_base,
-            /*exclusive_core_count=*/gcfg.core_count);
+            /*exclusive_core_count=*/poller_core_count);
 
         if (!ctx.poller->init_copy_engine()) {
             fprintf(stderr, "GPU %d: Failed to init copy engine\n", i);
@@ -555,4 +570,3 @@ int main() {
 
     return 0;
 }
-

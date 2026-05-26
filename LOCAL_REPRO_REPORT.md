@@ -933,6 +933,37 @@ nsys profile --trace=cuda,osrt --sample=process-tree --cpuctxsw=process-tree \
 - 主要是 GPU 后面一直在等 CPU poller + gather + DMA 完成
 - 所以 queue 模式在这个纯搬运 benchmark 里天然吃亏
 
+### 18.5.1 Submit-only 对比：GFD submit kernel vs BatchAsync API
+
+为了回答“`GFD submit kernel` 本身是不是比 `BatchAsync` 快”，又直接查了 3 个 `nsys` sqlite：
+
+- `nsys_128_128kb_stride.sqlite`
+- `nsys_512_64kb_stride.sqlite`
+- `nsys_1024_64kb_random_strict.sqlite`
+
+这里要先区分口径：
+
+- `bench_gfd_submit_kernel` 是 GPU 侧写 descriptor / 提交请求的 kernel 时间
+- `cudaMemcpyBatchAsync` 是 CPU 侧 CUDA Runtime API 调用时间
+- 这两个不是完全同一条执行 lane，但都能反映“提交动作”的量级
+- 它们都不是端到端 copy 完成时间
+
+直接查 `CUPTI_ACTIVITY_KIND_RUNTIME` 和 `CUPTI_ACTIVITY_KIND_KERNEL` 后，结果如下：
+
+| Case | `cudaMemcpyBatchAsync` API avg | `bench_gfd_submit_kernel` avg | Submit-only 判断 |
+| --- | ---: | ---: | --- |
+| `128 x 128KB stride` | `107.14 us` | `150.12 us` | `BatchAsync` 更轻 |
+| `512 x 64KB stride` | `411.40 us` | `164.56 us` | `GFD submit kernel` 更轻 |
+| `1024 x 64KB random+bind` | `813.32 us` | `193.19 us` | `GFD submit kernel` 更轻 |
+
+这说明：
+
+- 小 batch 下，`BatchAsync` API submit 本身更便宜
+- 到 `512/1024` entries 这种大 batch 后，`GFD submit kernel` 的提交动作确实更轻，大约快 `2.5x ~ 4.2x`
+- 但是这个结论只成立在 submit-only 口径下
+- 一旦看完整 `GFD Queue`，后面的 `wait kernel + CPU poller + gather + DMA` 仍然是主耗时
+- 所以最终端到端结果仍然是：`64KB+` 大 KV chunk 上，`BatchAsync` 更快
+
 ### 18.6 Direct 路径：DMA 提交不贵，贵的是 CPU 侧 staging/gather
 
 `cuda_api_sum` 里，`GFD` 对应的 `cuMemcpyHtoDAsync_v2` 平均 CPU API 时间只有：
@@ -970,6 +1001,7 @@ nsys profile --trace=cuda,osrt --sample=process-tree --cpuctxsw=process-tree \
 
 - `GFD` 的“合并提交”本身没有问题
 - 在 `1024 x 64KB` 这类 case 下，`Memcpy(N)` 是 `4096` 次 `cudaMemcpyAsync`，`BatchAsync` 是 `4` 次 API 调用，`GFD` 的 CE 提交只有 `24` 次
+- 只看 submit-only，大 batch 下 `GFD submit kernel` 比 `BatchAsync` API 更轻：`512 x 64KB` 是 `164.56 us` vs `411.40 us`，`1024 x 64KB` 是 `193.19 us` vs `813.32 us`
 - `GFD Queue` 慢，不是 `submit kernel` 慢；`submit kernel` 大约只有 `0.18 ~ 0.23 ms`，而 `wait kernel` 在 `2.10 ~ 6.02 ms`
 - `GFD Direct` 也不是慢在 DMA API 提交；`cuMemcpyHtoDAsync_v2` 平均只有 `19 ~ 27 us`
 - 真正没有被摊平的，是 `CPU gather -> staging -> GPU DMA` 这一段主机侧成本
@@ -1190,3 +1222,205 @@ echo 2048 | sudo tee /proc/sys/vm/nr_hugepages
 - 这些结论不是 `GPU0` 特例
 - 至少在 `GPU4` 上也能复现同样的趋势
 - 即使考虑到 `GPU4` 这组测法还不是严格 NUMA-local，它也没有出现“GFD 全面翻盘”的迹象
+
+## 22. Agentic-RL 超长序列模拟：64k / 128k / 256k
+
+为了模拟 agentic-RL 里的超长序列，这里补一组按序列长度扩展的实验。
+
+### 22.1 映射假设
+
+这组实验采用下面的映射：
+
+- vLLM 逻辑 block size 按 `16 tokens / block`
+- `per_block_bytes = 64KB`
+- `seq_len = 64k / 128k / 256k`
+- 对应 block 数：
+  - `64k tokens -> 4096 blocks`
+  - `128k tokens -> 8192 blocks`
+  - `256k tokens -> 16384 blocks`
+
+因此实际 benchmark 配置是：
+
+| Seq len | Blocks | per_block_bytes | Total transfer |
+| --- | ---: | ---: | ---: |
+| `64k` | `4096` | `64KB` | `256MB` |
+| `128k` | `8192` | `64KB` | `512MB` |
+| `256k` | `16384` | `64KB` | `1024MB` |
+
+说明：
+
+- 这里仍然是单卡 `CUDA_VISIBLE_DEVICES=0`
+- 地址模式是 regular `2x stride`
+- 端到端结果使用非 nsys run，`GFD_WARMUP=3`、`GFD_ITERS=5`
+- submit-only 结果使用 nsys run，`GFD_WARMUP=1`、`GFD_ITERS=3`
+- `256k` 这组因为 staging pool 需要 `5 x 1GB`，超过当前 `4GB` HugeTLB 预算，日志显示 `hugepage=no`
+
+### 22.2 端到端搬运时间
+
+命令模板：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=<blocks> \
+GFD_LARGE_SWEEP_TOKEN_SIZES=64KB \
+GFD_WARMUP=3 \
+GFD_ITERS=5 \
+./build/gfd_benchmark
+```
+
+日志：
+
+- `agentic_rl_seq65536_blocks4096_64kb_20260526_202120.log`
+- `agentic_rl_seq131072_blocks8192_64kb_20260526_202123.log`
+- `agentic_rl_seq262144_blocks16384_64kb_20260526_202127.log`
+
+端到端 P50：
+
+| Seq len | Blocks | Total | BatchAsync P50 | GFD Queue P50 | GFD Direct P50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `64k` | `4096` | `256MB` | `24.45 ms` | `55.42 ms` | `33.59 ms` |
+| `128k` | `8192` | `512MB` | `48.87 ms` | `101.29 ms` | `68.37 ms` |
+| `256k` | `16384` | `1024MB` | `94.19 ms` | `194.94 ms` | `125.77 ms` |
+
+对应带宽：
+
+| Seq len | Blocks | BatchAsync GB/s | GFD Queue GB/s | GFD Direct GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| `64k` | `4096` | `10.98` | `4.84` | `7.99` |
+| `128k` | `8192` | `10.99` | `5.30` | `7.85` |
+| `256k` | `16384` | `11.40` | `5.51` | `8.54` |
+
+读法：
+
+- `BatchAsync` 端到端基本线性扩展，稳定在 `~11 GB/s`
+- `GFD Queue` 也随总字节增长，但带宽只有 `~4.8-5.5 GB/s`
+- `GFD Direct` 比 `GFD Queue` 快，但仍低于 `BatchAsync`
+- 所以在这组 agentic-RL 超长序列模拟里，如果只看搬运完成时间，`BatchAsync` 仍然是最优
+
+### 22.3 Submit-only：BatchAsync API vs GFD submit kernel
+
+nsys 命令模板：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=<blocks> \
+GFD_LARGE_SWEEP_TOKEN_SIZES=64KB \
+GFD_WARMUP=1 \
+GFD_ITERS=3 \
+nsys profile --trace=cuda --sample=none --cpuctxsw=none \
+  --force-overwrite true \
+  -o agentic_rl_nsys/seq<seq>_blocks<blocks>_64kb \
+  ./build/gfd_benchmark
+```
+
+产物：
+
+- `agentic_rl_nsys/seq65536_blocks4096_64kb.nsys-rep`
+- `agentic_rl_nsys/seq65536_blocks4096_64kb.sqlite`
+- `agentic_rl_nsys/seq131072_blocks8192_64kb.nsys-rep`
+- `agentic_rl_nsys/seq131072_blocks8192_64kb.sqlite`
+- `agentic_rl_nsys/seq262144_blocks16384_64kb.nsys-rep`
+- `agentic_rl_nsys/seq262144_blocks16384_64kb.sqlite`
+
+从 `CUPTI_ACTIVITY_KIND_RUNTIME` 和 `CUPTI_ACTIVITY_KIND_KERNEL` 直接查到：
+
+| Seq len | Blocks | `cudaMemcpyBatchAsync` API avg | `bench_gfd_submit_kernel` avg | `bench_gfd_wait_kernel` avg |
+| --- | ---: | ---: | ---: | ---: |
+| `64k` | `4096` | `4.153 ms` | `0.567 ms` | `24.889 ms` |
+| `128k` | `8192` | `6.391 ms` | `0.612 ms` | `48.249 ms` |
+| `256k` | `16384` | `12.769 ms` | `2.099 ms` | `87.557 ms` |
+
+补充：
+
+- nsys 下 `cuMemcpyHtoDAsync_v2` 平均 API 时间只有 `~22-32 us`
+- 也就是说，GFD 侧真正提交 CE DMA 的 API 时间仍然很小
+- 但 `GFD Queue` 的 wait kernel 会等 CPU poller / gather / DMA 完成，时间随序列长度变大
+
+### 22.4 这一组的结论
+
+这组超长序列实验把前面的判断放大了：
+
+1. 只看 submit-only，大 batch 下 `GFD submit kernel` 明显比 `cudaMemcpyBatchAsync` API 更轻。
+   - `64k`: `0.567 ms` vs `4.153 ms`
+   - `128k`: `0.612 ms` vs `6.391 ms`
+   - `256k`: `2.099 ms` vs `12.769 ms`
+
+2. 但端到端搬运时间仍然是 `BatchAsync` 明显更快。
+   - `64k`: `24.45 ms` vs `GFD Direct 33.59 ms` / `GFD Queue 55.42 ms`
+   - `128k`: `48.87 ms` vs `GFD Direct 68.37 ms` / `GFD Queue 101.29 ms`
+   - `256k`: `94.19 ms` vs `GFD Direct 125.77 ms` / `GFD Queue 194.94 ms`
+
+3. 因此结论不是“GFD submit 慢”，而是：
+   - `GFD submit kernel` 本身很快
+   - `GFD Queue` 慢在 submit 后面的 wait / CPU gather / staging / DMA 完成
+   - `GFD Direct` 去掉 queue wait 后更接近，但仍然输给 `BatchAsync`
+
+4. 对 agentic-RL 超长序列，如果每个 block 已经是 `64KB` 这种大块，纯搬运路径应优先用 `BatchAsync`。
+   GFD 更适合继续作为 GPU submit / queue / overlap / scatter-gather 机制验证，而不是这组 `64KB block` 大块 H2D 的端到端带宽最优路径。
+
+### 22.5 追加：random slots + strict bind
+
+上面 22.2 / 22.3 的地址模式是 regular `2x stride`。为了避免“规则地址对 `BatchAsync` 太友好”的疑问，又补了同样三组 `random slots + strict bind`。
+
+命令模板：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GFD_LARGE_SWEEP=1 \
+GFD_LARGE_SWEEP_NUM_TOKENS=<blocks> \
+GFD_LARGE_SWEEP_TOKEN_SIZES=64KB \
+GFD_RANDOMIZE_ADDRS=1 \
+GFD_STRICT_BIND=1 \
+GFD_WARMUP=3 \
+GFD_ITERS=5 \
+./build/gfd_benchmark
+```
+
+端到端日志：
+
+- `agentic_rl_random_strict_seq65536_blocks4096_64kb_20260526_202626.log`
+- `agentic_rl_random_strict_seq131072_blocks8192_64kb_20260526_202629.log`
+- `agentic_rl_random_strict_seq262144_blocks16384_64kb_20260526_202633.log`
+
+端到端 P50：
+
+| Seq len | Blocks | Total | BatchAsync P50 | GFD Queue P50 | GFD Direct P50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `64k` | `4096` | `256MB` | `25.07 ms` | `51.26 ms` | `34.61 ms` |
+| `128k` | `8192` | `512MB` | `50.06 ms` | `94.07 ms` | `69.11 ms` |
+| `256k` | `16384` | `1024MB` | `95.84 ms` | `188.37 ms` | `126.32 ms` |
+
+对应带宽：
+
+| Seq len | Blocks | BatchAsync GB/s | GFD Queue GB/s | GFD Direct GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| `64k` | `4096` | `10.71` | `5.24` | `7.76` |
+| `128k` | `8192` | `10.72` | `5.71` | `7.77` |
+| `256k` | `16384` | `11.20` | `5.70` | `8.50` |
+
+random + strict 的 nsys 产物：
+
+- `agentic_rl_nsys_random_strict/seq65536_blocks4096_64kb_random_strict.nsys-rep`
+- `agentic_rl_nsys_random_strict/seq65536_blocks4096_64kb_random_strict.sqlite`
+- `agentic_rl_nsys_random_strict/seq131072_blocks8192_64kb_random_strict.nsys-rep`
+- `agentic_rl_nsys_random_strict/seq131072_blocks8192_64kb_random_strict.sqlite`
+- `agentic_rl_nsys_random_strict/seq262144_blocks16384_64kb_random_strict.nsys-rep`
+- `agentic_rl_nsys_random_strict/seq262144_blocks16384_64kb_random_strict.sqlite`
+
+submit-only：
+
+| Seq len | Blocks | `cudaMemcpyBatchAsync` API avg | `bench_gfd_submit_kernel` avg | `bench_gfd_wait_kernel` avg |
+| --- | ---: | ---: | ---: | ---: |
+| `64k` | `4096` | `3.779 ms` | `0.834 ms` | `24.015 ms` |
+| `128k` | `8192` | `7.513 ms` | `1.233 ms` | `46.444 ms` |
+| `256k` | `16384` | `15.029 ms` | `2.285 ms` | `79.260 ms` |
+
+这组追加实验说明：
+
+- random slots 没有把 `BatchAsync` 打崩，`BatchAsync` 端到端仍然稳定在 `~10.7-11.2 GB/s`
+- `GFD submit kernel` 在 submit-only 口径下仍然明显更轻
+- `GFD Queue` 的主要时间仍然在 wait kernel，而不是 submit kernel
+- `GFD Direct` 仍然比 `GFD Queue` 快，但端到端仍然追不上 `BatchAsync`
+- 因此“regular stride 过于有利于 BatchAsync”不是这组 `64KB block` 结论的主因

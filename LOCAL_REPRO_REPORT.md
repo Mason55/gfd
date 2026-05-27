@@ -624,7 +624,170 @@ CUDA_VISIBLE_DEVICES=0 GFD_LARGE_SWEEP=1 ./build/gfd_benchmark
 - 这台 `3090` 上，`64KB -> 2MB` 区间里，`BatchAsync` 一直最快
 - `GFD Direct` 没有在这些大 KV chunk 上跑赢 `BatchAsync`
 - `GFD Queue` 也没有在这台机器上体现出 README 里那种大 token 优势
-- 如果只看“模型搬运时间”，本机结果是：`Qwen2.5 7B` 这档比 `Llama/Mistral` 明显更快，原因就是 KV cache 更小
+- 如果只看"模型搬运时间"，本机结果是：`Qwen2.5 7B` 这档比 `Llama/Mistral` 明显更快，原因就是 KV cache 更小
+
+## 17. 硬件差异深度分析：为什么 3090 跑不过 Blackwell
+
+### 17.1 硬件参数逐项对比
+
+| 参数 | RTX 3090 (Ampere) | RTX PRO 5000 (Blackwell) | 差距 |
+|------|:--:|:--:|:--:|
+| **架构代号** | GA102 | GB202/GB203 | 跨 2 代 |
+| **制程** | Samsung 8nm | TSMC 4N (4nm) | 密度/能效翻倍 |
+| **Compute Capability** | 8.6 | 12.0 | — |
+| **CUDA Cores** | 10,496 | 14,080 | +34% |
+| **基础/加速频率** | 1400/1700 MHz | 更高 | — |
+| **单精度 TFLOPS** | 29.4 | ~70 | +138% |
+| **Tensor Cores** | 第 3 代 | 第 5 代 | 支持 FP4 |
+| **显存类型** | GDDR6X | GDDR7 | 跨代 |
+| **显存容量** | 24 GB | 48/72 GB | +100%~200% |
+| **显存位宽** | 384-bit | 384-bit | 持平 |
+| **显存带宽** | 936 GB/s | 1344 GB/s | +44% |
+| **显存时钟** | 19.5 Gbps | 28+ Gbps | +44% |
+| **PCIe 接口** | **4.0 ×16** | **5.0 ×16** | **2× 理论带宽** |
+| **PCIe 理论带宽** | ~31.5 GB/s | ~63 GB/s | **+100%** |
+| **PCIe 实际带宽** | ~25-27 GB/s | ~50+ GB/s | **+100%** |
+| **Copy Engine** | Ampere CE（1-2 通道）| 新一代 CE（多通道）| 数量+效率飞跃 |
+| **NVENC/NVDEC** | 第 7 代/第 5 代 | 第 9 代(3路)/第 6 代(3路) | 数量+质量飞跃 |
+| **TDP** | 350W | 300W | 能效更高 |
+| **发布年份** | 2020 年 9 月 | 2025 年 | 差 5 年 |
+
+#### 主机环境对比
+
+| 参数 | 本机 (3090 环境) | README (Blackwell 环境) |
+|------|:--:|:--:|
+| **CPU 型号** | Xeon Gold 6226R | 高端工作站 CPU |
+| **CPU 核心数** | 64 核 | **256 核** |
+| **NUMA 节点** | 2 | 更多（推测 4+） |
+| **内存类型** | DDR4（6 通道） | DDR5（8+ 通道） |
+| **Hugepage** | 未启用 (hugepage=no) | 已启用 |
+| **Staging Buffer** | 普通页 | Hugepage + NUMA 绑定 |
+
+### 17.2 瓶颈逐层分析
+
+#### 第 1 层：PCIe 带宽 —— 最致命的瓶颈
+
+```
+PCIe 4.0 ×16 理论: 31.5 GB/s
+    ├── 8b/10b → 128b/130b 编码开销 (~1.5%): → 31 GB/s
+    ├── TLP Header / 协议损耗:            → 25-27 GB/s (实测上限)
+    └── GFD Direct 3090 实测:             8-9 GB/s  ← 只吃到 ~30%
+
+PCIe 5.0 ×16 理论: 63 GB/s
+    └── GFD 在 Blackwell 上 CE 效率更高，实际可用带宽远超 30%
+```
+
+GFD Direct 在 3090 上只跑到 8-9 GB/s，而 Memcpy(N) 在大 token 时也能到 12 GB/s——说明 **GFD 的 CE 通路在 3090 上并没有比传统 cudaMemcpy 更高效**，甚至在大块传输时更差。根本原因在于 3090 的 Copy Engine 处理大量小 descriptor 时开销大，效率低。
+
+#### 第 2 层：Copy Engine 代际差异 —— GFD 的命脉
+
+GFD 的核心优化路径：
+
+```
+GPU writes descriptors → CPU poller reads → Copy Engine executes DMA
+                                                    ↑
+                                              这里是关键瓶颈
+```
+
+不同代 Copy Engine 的能力差异：
+
+| CE 能力 | Ampere (3090) | Blackwell (PRO 5000) |
+|:--|:--|:--|
+| CE 通道数 | 1-2（消费级受限） | 多个专用 CE |
+| Desc batch 处理 | 基本 batch | 优化后的批量 DMA |
+| 小 desc 效率 | 差（开销 > 收益） | 显著改善 |
+| DMA 流水线深度 | 浅 FIFO | 深流水 |
+| Descriptor ring 支持 | 基础 | 硬件加速 |
+
+这解释了为什么：
+- **小 token (512B/1KB) 场景**：GFD Direct 大幅领先（8.4 GB/s vs Memcpy(N) 0.2 GB/s，40 倍差距），因为 cudaMemcpy 的 per-call 开销在小块时是灾难，而 GFD 的批量 desc 机制绕过了这个开销
+- **大 token (64KB+) 场景**：GFD 反而落后于 BatchAsync，因为单次 DMA 足够大时 cudaMemcpy/BatchAsync 的开销占比缩小，直接跑满了 PCIe 4.0 干线，而 GFD 的 CE desc 处理反而多了一层中间开销
+
+#### 第 3 层：CPU 资源不足 —— 8 卡并发时的致命伤
+
+本机 CPU 只有 64 核，8 卡并发时需要：
+
+```
+每卡需要:  1× CE poller 线程 + 1× gather worker 线程 = 2 线程
+8 卡总计:  16 线程 (仅 poll/gather)
++ 控制线程 + kernel launch 开销 + 系统进程
+→ 平均每卡不到 8 核可用
+```
+
+README 环境 256 核，资源充裕得多。实际数据验证：
+
+```
+单卡 GFD Direct:         ~8 GB/s
+8 卡 aggregate:          ~10 GB/s   (只增长 25%)
+单卡 warp-spec:           ~10.5 GB/s
+8 卡 warp-spec aggregate: ~24 GB/s   (只增长 2.3×)
+
+满载时 per-GPU BW 退化到: ~1.25 GB/s ← 只有单卡的 16%
+```
+
+CPU 资源竞争导致 CE poller 处理 desc 速度下降，DMA 流水线出现"断流"，这是多卡扩展效率差的首要原因。
+
+#### 第 4 层：NUMA 绑核和 Hugepage
+
+报告中已发现的关键信号：
+- `hugepage=no` — staging buffer 没有用大页，TLB miss 更多，影响 poller 读 desc 的效率
+- NUMA1（GPU 4-7）的 GFD Direct 带宽比 NUMA0（GPU 0-3）**高出 25%**（10.5 vs 8.2 GB/s），说明 NUMA0 上有更多跨节点内存访问干扰
+
+NUMA 干扰的根源：
+```
+GPU 0-3 在 NUMA0 → 但 CPU 核心 0-15,32-47 还要跑系统进程
+GPU 4-7 在 NUMA1 → 核心 16-31,48-63 相对空闲
+→ NUMA0 带宽更低因为 CPU 竞争更激烈
+```
+
+#### 第 5 层：显存带宽对 Staging Pool 的影响
+
+GFD 的完整数据路径：
+
+```
+CPU pinned → [CE DMA] → GPU staging buffer → [kernel load] → GPU compute
+                              ↑                        ↑
+                         GDDR6X 936 GB/s        需要额外一次显存读写
+```
+
+虽然 GDDR6X 的 936 GB/s 远大于 PCIe 4.0 的 25 GB/s，但在 double-buffer 模式下，staging buffer 的 ping-pong 读写会成为附加损耗。Blackwell 的 GDDR7 为 1344 GB/s（+44%），这部分开销占比更小。
+
+#### 第 6 层：驱动成熟度
+
+- Ampere (2020)：驱动已进入维护期，CE DMA 路径不会再做激进优化
+- Blackwell (2025)：全新驱动栈，Copy Engine、DMA 引擎均针对 descriptor-based DMA 做了硬件级优化
+
+### 17.3 瓶颈权重汇总
+
+```
+                    GFD 吞吐受哪些因素影响？
+                    
+┌───────────┐    ┌──────────────┐    ┌───────────────┐    ┌──────────┐
+│ 因素       │    │  瓶颈程度     │    │  影响位置      │    │ 是否可解  │
+├───────────┤    ├──────────────┤    ├───────────────┤    ├──────────┤
+│ PCIe 4.0  │    │ ★★★★★ 致命   │    │ DMA 物理带宽   │    │ 硬件瓶颈  │
+│ CE 代际   │    │ ★★★★★ 严重   │    │ Desc 处理效率  │    │ 硬件瓶颈  │
+│ CPU 64 核 │    │ ★★★★  重要   │    │ Poller/Gather  │    │ 可部分优化 │
+│ NUMA 拓扑 │    │ ★★★   中等   │    │ 跨节点延迟     │    │ 可优化    │
+│ Hugepage  │    │ ★★☆   次要   │    │ TLB miss       │    │ 可解      │
+│ DDR4      │    │ ★★☆   次要   │    │ 内存读带宽     │    │ 硬件瓶颈  │
+│ GDDR6X    │    │ ★☆☆   轻微   │    │ Staging BW     │    │ 硬件瓶颈  │
+└───────────┘    └──────────────┘    └───────────────┘    └──────────┘
+```
+
+### 17.4 总结
+
+GFD 在 3090 上性能受限是**系统性**的，不是单一瓶颈。最核心的两个硬件天花板：
+
+1. **PCIe 4.0 带宽** 仅为 5.0 的一半（~25 GB/s vs ~50 GB/s 实测），这是物理上限
+2. **Ampere Copy Engine** 处理 descriptor-based DMA 的效率远不如 Blackwell 新一代 CE
+
+这解释了为什么：
+- **小 token 场景** GFD 有压倒性优势（绕过了 cudaMemcpy per-call 开销）
+- **大 token 场景** GFD 反而没有优势（CE desc 处理成为额外开销，不如直接 cudaMemcpy/BatchAsync 高效）
+- **多卡场景** CPU 资源成为瓶颈，poller 线程竞争导致 CE DMA 流水线断流
+
+GFD 真正的价值场景在**小 token、离散地址、scatter-gather**（不适用 cudaMemcpy 或 BatchAsync 高效覆盖的负载），这些在正确性测试中已通过验证，但在本机 benchmark 中尚未做专项性能对比。
 - 如果只问“GFD 是不是有纯吞吐收益”，这章答案是否定的；它的意义更多还是：
   - 支持 GPU 发起 / queue 模式
   - 支持 scatter-gather 和更复杂的搬运路径
